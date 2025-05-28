@@ -426,3 +426,221 @@ for exp_name, best_mape in results_full.items():
 # best_model.load_state_dict(torch.load('checkpoints/Exp_HybridAdaptiveWeights_best_mape.pth'))
 # best_model.to(device)
 """ 
+
+def run_refined_phase2_experiments_integrated(num_epochs=30, min_velocity=1.5):
+    """Run the complete refined Phase 2 experimental suite with all fixes and improvements.
+    
+    This includes:
+    1. All original experiments with critical bug fixes
+    2. Systematic weight tuning around champion [1.0, 0.1, 0.005]  
+    3. Fixed curriculum learning with proper SoftAdapt initialization
+    4. Improved SoftAdapt scaling based on component magnitude analysis
+    
+    Args:
+        num_epochs: Number of training epochs (recommend 30+ for full experiments)
+        min_velocity: Minimum velocity for clamping (from your EDA)
+    """
+    
+    # Verify integration
+    if not integrate_phase2_with_existing_notebook():
+        return None
+    
+    # Setup data loaders
+    train_loader, val_loader = setup_phase2_data_loaders()
+    if train_loader is None or val_loader is None:
+        return None
+    
+    print(f"\n🚀 Starting REFINED Phase 2 experiments with {num_epochs} epochs per experiment...")
+    print("🔧 All critical bugs fixed, systematic tuning implemented")
+    print("📊 This will systematically test 6 core experiments + weight tuning")
+    print("⏱️  Estimated time: ~{} minutes".format(num_epochs * 6 * len(train_loader) // 8))
+    
+    # Run the refined experimental suite
+    results = run_refined_phase2_experiments(
+        BaselineUNet=BaselineUNet,
+        train_loader=train_loader,
+        val_loader=val_loader,
+        calculate_mape=calculate_mape,
+        device=device,
+        num_epochs=num_epochs,
+        min_velocity=min_velocity
+    )
+    
+    return results
+
+def test_systematic_weight_tuning_only(num_epochs=15, champion_mape=0.3790):
+    """Test only the systematic weight tuning around champion weights [1.0, 0.1, 0.005].
+    
+    This is useful for focused tuning experiments without running the full suite.
+    """
+    print("🎯 Testing systematic weight tuning around champion weights...")
+    
+    # Verify integration
+    if not integrate_phase2_with_existing_notebook():
+        return None
+    
+    # Setup data loaders
+    train_loader, val_loader = setup_phase2_data_loaders()
+    if train_loader is None or val_loader is None:
+        return None
+    
+    print(f"🔬 Running systematic weight tuning with {num_epochs} epochs per test...")
+    print(f"🏆 Target to beat: {champion_mape:.4f}% MAPE")
+    
+    # Run systematic weight tuning
+    results = run_systematic_weight_tuning_experiments(
+        BaselineUNet=BaselineUNet,
+        train_loader=train_loader,
+        val_loader=val_loader,
+        calculate_mape=calculate_mape,
+        device=device,
+        num_epochs=num_epochs,
+        min_velocity=1.5,
+        champion_mape=champion_mape
+    )
+    
+    return results
+
+def test_fixed_curriculum_only(num_epochs=25):
+    """Test only the fixed curriculum learning experiment to verify the bug fix."""
+    print("🧪 Testing fixed curriculum learning + SoftAdapt...")
+    
+    # Verify integration
+    if not integrate_phase2_with_existing_notebook():
+        return None
+    
+    # Setup data loaders
+    train_loader, val_loader = setup_phase2_data_loaders()
+    if train_loader is None or val_loader is None:
+        return None
+    
+    print(f"🔬 Testing curriculum learning with {num_epochs} epochs...")
+    print("📚 First 10 epochs: LogMAE only, then full hybrid with SoftAdapt")
+    
+    # Create model and optimizer
+    model = BaselineUNet(5, 1).to(device)
+    optimizer = optim.AdamW(model.parameters(), lr=1e-4, weight_decay=0.01)
+    
+    # Create fixed curriculum loss with proper initialization
+    criterion = RefinedLogSpaceMAEHybridLoss(
+        min_velocity=1.5,
+        use_adaptive_softadapt=True,
+        logmae_momentum=0,  # Use fixed c=0.1
+        initial_c_logmae=0.1,
+        start_simple=True,
+        curriculum_epochs=10,
+        component_scales="adaptive",  # [15.0, 2.0, 50.0]
+        softadapt_beta=0.1,
+        softadapt_update_freq=5
+    ).to(device)
+    
+    # Run training with fixed curriculum function
+    best_mape = train_with_curriculum_fixed(
+        "Test_FixedCurriculum", model, train_loader, val_loader,
+        criterion, optimizer, num_epochs, device, calculate_mape
+    )
+    
+    print(f"✅ Fixed curriculum test completed! Best MAPE: {best_mape:.4f}%")
+    return {'FixedCurriculum': best_mape}
+
+def validate_champion_weights(num_epochs=20):
+    """Validate the current champion hybrid weights [1.0, 0.1, 0.005] with fresh training."""
+    print("🏆 Validating champion hybrid weights [1.0, 0.1, 0.005]...")
+    
+    # Verify integration
+    if not integrate_phase2_with_existing_notebook():
+        return None
+    
+    # Setup data loaders
+    train_loader, val_loader = setup_phase2_data_loaders()
+    if train_loader is None or val_loader is None:
+        return None
+    
+    print(f"🔬 Validating champion with {num_epochs} epochs...")
+    
+    # Create model and optimizer
+    model = BaselineUNet(5, 1).to(device)
+    optimizer = optim.AdamW(model.parameters(), lr=1e-4, weight_decay=0.01)
+    
+    # Create champion hybrid loss
+    criterion = RefinedLogSpaceMAEHybridLoss(
+        min_velocity=1.5,
+        use_adaptive_softadapt=False,
+        logmae_momentum=0,  # Use fixed c=0.1 (best single component)
+        initial_c_logmae=0.1,
+        fixed_weights_list=[1.0, 0.1, 0.005]
+    ).to(device)
+    
+    # Run training
+    best_mape, history = train_validate_model(
+        "Validate_Champion", model, train_loader, val_loader,
+        criterion, optimizer, num_epochs, device, calculate_mape
+    )
+    
+    print(f"✅ Champion validation completed!")
+    print(f"🎯 Validation MAPE: {best_mape:.4f}%")
+    
+    # Plot validation results
+    plot_history(history, "Champion Validation [1.0, 0.1, 0.005]")
+    
+    return {'ChampionValidation': best_mape, 'history': history}
+
+# =============================================================================
+# ENHANCED READY-TO-USE EXPERIMENTAL COMMANDS
+# =============================================================================
+
+print("\n" + "="*60)
+print("REFINED PHASE 2 EXPERIMENTAL FRAMEWORK READY!")
+print("="*60)
+print("🔧 Critical bugs fixed:")
+print("   ✓ Curriculum learning AttributeError resolved")
+print("   ✓ SoftAdapt scaling improved based on component analysis")
+print("   ✓ Enhanced error handling and initialization")
+print()
+print("Available commands:")
+print()
+print("🏆 1. Validate Current Champion (Quick):")
+print("   results = validate_champion_weights(num_epochs=20)")
+print()
+print("🎯 2. Systematic Weight Tuning Only:")
+print("   results = test_systematic_weight_tuning_only(num_epochs=15)")
+print()
+print("🧪 3. Test Fixed Curriculum Learning:")
+print("   results = test_fixed_curriculum_only(num_epochs=25)")
+print()
+print("🚀 4. Complete Refined Phase 2 Suite (Full):")
+print("   results = run_refined_phase2_experiments_integrated(num_epochs=30)")
+print()
+print("⚡ 5. Quick Setup Test (Previous - Still Available):")
+print("   results = quick_test_phase2_setup()")
+print()
+print("🔧 Enhanced Loss Functions Available:")
+print("   ✓ RefinedLogSpaceMAEHybridLoss with proper curriculum support")
+print("   ✓ Systematic weight tuning around champion [1.0, 0.1, 0.005]")
+print("   ✓ Improved SoftAdapt scaling [15.0, 2.0, 50.0]")
+print("   ✓ Multiple SoftAdapt configurations (responsive, conservative)")
+print("="*60)
+
+# Example usage with refined experiments
+"""
+# REFINED USAGE EXAMPLE:
+
+# 1. Quick validation of current champion
+champion_results = validate_champion_weights()
+
+# 2. If validation successful, test systematic weight tuning
+tuning_results = test_systematic_weight_tuning_only(num_epochs=15, champion_mape=champion_results['ChampionValidation'])
+
+# 3. Test fixed curriculum learning (bug was critical)
+curriculum_results = test_fixed_curriculum_only()
+
+# 4. If individual tests pass, run complete refined suite
+full_results = run_refined_phase2_experiments_integrated(num_epochs=30)
+
+# 5. Analyze final results
+print("FINAL ANALYSIS:")
+print(f"Champion Validation: {champion_results['ChampionValidation']:.4f}% MAPE")
+best_tuning = min(tuning_results.values()) if tuning_results else float('inf')
+print(f"Best Tuning Result: {best_tuning:.4f}% MAPE") 
+print(f"Curriculum Learning: {curriculum_results['FixedCurriculum']:.4f}% MAPE")
+""" 

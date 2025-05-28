@@ -154,12 +154,12 @@ class AnisotropicTotalVariationLoss(nn.Module):
 
 
 class RefinedLogSpaceMAEHybridLoss(nn.Module):
-    """Refined multi-component hybrid loss with better scaling and curriculum learning.
+    """Refined multi-component hybrid loss with improved curriculum learning and SoftAdapt scaling.
     
-    Addresses issues identified in initial hybrid loss experiments:
-    1. Loss component scaling for SoftAdapt
-    2. Curriculum learning options
-    3. Better weight initialization
+    CRITICAL FIXES for experimental reliability:
+    1. Proper current_weights initialization for curriculum learning
+    2. Improved pre-scaling for SoftAdapt based on observed component magnitudes
+    3. Better curriculum transition logic
     """
     def __init__(self, min_velocity=1.5, use_adaptive_softadapt=True,
                  initial_c_logmae=0.1, logmae_momentum=0.9,
@@ -167,9 +167,9 @@ class RefinedLogSpaceMAEHybridLoss(nn.Module):
                  atv_weight_h=1.0, atv_weight_v=0.3,
                  softadapt_beta=0.1, softadapt_update_freq=10,
                  fixed_weights_list=[1.0, 0.3, 0.005],
-                 # New parameters for refinement
+                 # Enhanced parameters for refinement
                  scale_for_softadapt=True,
-                 component_scales=[10.0, 1.0, 100.0],  # Scale factors for [logmae, msssim, atv]
+                 component_scales="adaptive",  # "adaptive" or list like [10.0, 1.0, 100.0]
                  curriculum_epochs=0,  # Epochs to train only LogMAE before activating other components
                  start_simple=False):  # If True, start with only LogMAE
         super().__init__()
@@ -190,40 +190,68 @@ class RefinedLogSpaceMAEHybridLoss(nn.Module):
         
         # Refinement parameters
         self.scale_for_softadapt = scale_for_softadapt
-        self.component_scales = component_scales
         self.curriculum_epochs = curriculum_epochs
         self.start_simple = start_simple
         self.register_buffer('epoch_counter', torch.tensor(0))
         
-        # SoftAdapt setup
-        self.use_adaptive_softadapt = use_adaptive_softadapt and not start_simple
-        if self.use_adaptive_softadapt and LossWeightedSoftAdapt is not None:
+        # Enhanced component scaling based on observed magnitudes from successful experiments
+        if component_scales == "adaptive":
+            # Based on observed magnitudes from R2_FullHybrid_w0.1_0.005 (best result: 0.3790% MAPE)
+            # Typical observed values: LogMAE ~0.03, MS-SSIM ~0.2, ATV ~0.05
+            # Goal: bring them to similar order of magnitude for SoftAdapt
+            self.component_scales = [15.0, 2.0, 50.0]  # Refined based on analysis
+        else:
+            self.component_scales = component_scales
+        
+        # SoftAdapt configuration storage for curriculum learning
+        self.softadapt_beta = softadapt_beta
+        self.update_frequency = softadapt_update_freq
+        
+        # CRITICAL FIX: Always initialize current_weights to avoid AttributeError
+        self.register_buffer('fixed_weights', torch.tensor(fixed_weights_list, dtype=torch.float32))
+        self.register_buffer('current_weights', torch.tensor(fixed_weights_list, dtype=torch.float32))
+        
+        # SoftAdapt setup with proper initialization
+        self.config_use_adaptive_softadapt = use_adaptive_softadapt
+        self.use_adaptive_softadapt_active = self.config_use_adaptive_softadapt and not start_simple
+        
+        if self.use_adaptive_softadapt_active and LossWeightedSoftAdapt is not None:
             self.softadapt_object = LossWeightedSoftAdapt(
                 beta=softadapt_beta,
                 accuracy_order=2
             )
             self.loss_history = {'logmae': [], 'msssim': [], 'atv': []}
-            self.update_frequency = softadapt_update_freq
             self.iteration = 0
-            self.register_buffer('current_weights', torch.tensor(fixed_weights_list, dtype=torch.float32))
-        else:
-            if self.use_adaptive_softadapt and LossWeightedSoftAdapt is None:
-                print("Warning: SoftAdapt requested but not available. Using fixed weights.")
-                self.use_adaptive_softadapt = False
-            self.register_buffer('fixed_weights', torch.tensor(fixed_weights_list, dtype=torch.float32))
+        elif self.config_use_adaptive_softadapt and LossWeightedSoftAdapt is None:
+            print("Warning: SoftAdapt requested but not available. Using fixed weights.")
+            self.use_adaptive_softadapt_active = False
 
     def set_epoch(self, epoch):
-        """Set current epoch for curriculum learning."""
+        """Set current epoch for curriculum learning with proper SoftAdapt activation."""
         self.epoch_counter = torch.tensor(epoch)
         
-        # Activate full hybrid loss after curriculum period
-        if self.start_simple and epoch >= self.curriculum_epochs and not self.use_adaptive_softadapt:
-            print(f"🔄 Activating full hybrid loss at epoch {epoch}")
-            self.use_adaptive_softadapt = True
+        # CRITICAL FIX: Proper curriculum transition with current_weights initialization
+        if (self.start_simple and epoch >= self.curriculum_epochs and 
+            self.config_use_adaptive_softadapt and not self.use_adaptive_softadapt_active):
+            
+            print(f"🔄 Activating full adaptive hybrid loss at epoch {epoch}")
+            self.use_adaptive_softadapt_active = True
+            
             if LossWeightedSoftAdapt is not None:
-                self.softadapt_object = LossWeightedSoftAdapt(beta=0.1, accuracy_order=2)
+                # Re-initialize SoftAdapt components
+                self.softadapt_object = LossWeightedSoftAdapt(
+                    beta=self.softadapt_beta, 
+                    accuracy_order=2
+                )
                 self.loss_history = {'logmae': [], 'msssim': [], 'atv': []}
                 self.iteration = 0
+                
+                # CRITICAL FIX: Ensure current_weights is properly initialized
+                self.current_weights = self.fixed_weights.clone().to(self.current_weights.device)
+                print(f"✓ SoftAdapt initialized with starting weights: {self.current_weights.cpu().numpy()}")
+            else:
+                print("⚠️  SoftAdapt library not available, falling back to fixed weights")
+                self.use_adaptive_softadapt_active = False
 
     def forward(self, vp_pred, vp_target):
         # Always compute LogMAE
@@ -242,9 +270,9 @@ class RefinedLogSpaceMAEHybridLoss(nn.Module):
         msssim_val = self.seismic_ms_ssim(vp_pred, vp_target)
         atv_val = self.anisotropic_tv(vp_pred)
 
-        # SoftAdapt weight adaptation
-        if self.use_adaptive_softadapt and self.training:
-            # Scale components for SoftAdapt if enabled
+        # SoftAdapt weight adaptation with improved scaling
+        if self.use_adaptive_softadapt_active and self.training:
+            # Enhanced pre-scaling for SoftAdapt
             if self.scale_for_softadapt:
                 scaled_logmae = logmae_val.item() * self.component_scales[0]
                 scaled_msssim = msssim_val.item() * self.component_scales[1]
@@ -259,30 +287,38 @@ class RefinedLogSpaceMAEHybridLoss(nn.Module):
             
             self.iteration += 1
             
+            # SoftAdapt weight updates with error handling
             if self.iteration > 1 and self.iteration % self.update_frequency == 0:
                 history_for_softadapt = [
                     torch.tensor(self.loss_history['logmae'][-self.update_frequency:], dtype=torch.float32),
                     torch.tensor(self.loss_history['msssim'][-self.update_frequency:], dtype=torch.float32),
                     torch.tensor(self.loss_history['atv'][-self.update_frequency:], dtype=torch.float32)
                 ]
+                
                 if all(len(h) >= 2 for h in history_for_softadapt):
-                    adapted_weights_raw = self.softadapt_object.get_component_weights(
-                        *history_for_softadapt, verbose=False
-                    )
-                    # Handle TensorFlow tensor conversion
-                    if not isinstance(adapted_weights_raw, torch.Tensor):
-                        if hasattr(adapted_weights_raw, 'numpy'):
-                            adapted_weights_np = adapted_weights_raw.numpy()
+                    try:
+                        adapted_weights_raw = self.softadapt_object.get_component_weights(
+                            *history_for_softadapt, verbose=False
+                        )
+                        
+                        # Enhanced TensorFlow tensor conversion
+                        if not isinstance(adapted_weights_raw, torch.Tensor):
+                            if hasattr(adapted_weights_raw, 'numpy'):
+                                adapted_weights_np = adapted_weights_raw.numpy()
+                            else:
+                                adapted_weights_np = np.array(adapted_weights_raw, dtype=np.float32)
+                            adapted_weights_pytorch = torch.from_numpy(adapted_weights_np)
                         else:
-                            adapted_weights_np = np.array(adapted_weights_raw, dtype=np.float32)
-                        adapted_weights_pytorch = torch.from_numpy(adapted_weights_np)
-                    else:
-                        adapted_weights_pytorch = adapted_weights_raw
+                            adapted_weights_pytorch = adapted_weights_raw
 
-                    self.current_weights = adapted_weights_pytorch.to(device=vp_pred.device, dtype=torch.float32)
+                        self.current_weights = adapted_weights_pytorch.to(
+                            device=vp_pred.device, dtype=torch.float32
+                        )
+                        
+                    except Exception as e:
+                        print(f"⚠️  SoftAdapt update failed: {e}, using previous weights")
+                        # Keep current_weights unchanged
             
-            weights_to_use = self.current_weights
-        elif self.use_adaptive_softadapt and not self.training:
             weights_to_use = self.current_weights
         else:
             weights_to_use = self.fixed_weights.to(vp_pred.device)
@@ -491,6 +527,371 @@ def plot_history(history, title_prefix="", save_path=None):
     plt.show()
 
 
+def run_systematic_weight_tuning_experiments(BaselineUNet, train_loader, val_loader, calculate_mape, device,
+                                            num_epochs=20, min_velocity=1.5, champion_mape=0.3790):
+    """Systematic manual tuning around the champion weights [1.0, 0.1, 0.005].
+    
+    This function implements the precise weight tuning strategy identified from analysis:
+    1. Keep LogMAE at 1.0 (reference weight)
+    2. Vary MS-SSIM weight around 0.1 while keeping ATV at 0.005
+    3. With best MS-SSIM weight, vary ATV weight around 0.005
+    
+    Args:
+        champion_mape: Current best MAPE to beat (0.3790% from R2_FullHybrid_w0.1_0.005)
+    """
+    
+    print("="*80)
+    print("SYSTEMATIC WEIGHT TUNING EXPERIMENTS")
+    print(f"Goal: Beat champion MAPE of {champion_mape:.4f}%")
+    print("Strategy: Guided search around weights [1.0, 0.1, 0.005]")
+    print("="*80)
+    
+    results = {}
+    LEARNING_RATE = 1e-4
+    WEIGHT_DECAY = 0.01
+    
+    # Phase 1: Vary MS-SSIM weight while keeping ATV fixed at 0.005
+    print(f"\n📊 Phase 1: MS-SSIM Weight Tuning (ATV fixed at 0.005)")
+    print("-" * 60)
+    
+    ms_ssim_weights = [0.05, 0.08, 0.12, 0.15, 0.20]  # Around 0.1
+    atv_weight_fixed = 0.005
+    
+    for w_msssim in ms_ssim_weights:
+        print(f"\n🔬 Testing weights [1.0, {w_msssim}, {atv_weight_fixed}]...")
+        
+        model = BaselineUNet(5, 1).to(device)
+        optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
+        criterion = RefinedLogSpaceMAEHybridLoss(
+            min_velocity=min_velocity,
+            use_adaptive_softadapt=False,
+            logmae_momentum=0,  # Use fixed c=0.1 (best single component)
+            initial_c_logmae=0.1,
+            fixed_weights_list=[1.0, w_msssim, atv_weight_fixed]
+        ).to(device)
+        
+        best_mape, _ = train_validate_model(
+            f"Tune_MSSSIM_{w_msssim}", model, train_loader, val_loader,
+            criterion, optimizer, num_epochs, device, calculate_mape
+        )
+        
+        results[f'MSSSIM_{w_msssim}'] = best_mape
+        improvement = "🏆 NEW CHAMPION!" if best_mape < champion_mape else f"({(best_mape-champion_mape)/champion_mape*100:+.1f}%)"
+        print(f"✓ Weights [1.0, {w_msssim}, {atv_weight_fixed}]: {best_mape:.4f}% MAPE {improvement}")
+    
+    # Find best MS-SSIM weight from Phase 1
+    best_msssim_result = min(results.items(), key=lambda x: x[1])
+    best_msssim_weight = float(best_msssim_result[0].split('_')[1])
+    best_msssim_mape = best_msssim_result[1]
+    
+    print(f"\n🎯 Phase 1 Best: MS-SSIM weight {best_msssim_weight} → {best_msssim_mape:.4f}% MAPE")
+    
+    # Phase 2: Vary ATV weight with best MS-SSIM weight
+    print(f"\n📊 Phase 2: ATV Weight Tuning (MS-SSIM fixed at {best_msssim_weight})")
+    print("-" * 60)
+    
+    atv_weights = [0.001, 0.003, 0.007, 0.010, 0.015]  # Around 0.005
+    
+    for w_atv in atv_weights:
+        print(f"\n🔬 Testing weights [1.0, {best_msssim_weight}, {w_atv}]...")
+        
+        model = BaselineUNet(5, 1).to(device)
+        optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
+        criterion = RefinedLogSpaceMAEHybridLoss(
+            min_velocity=min_velocity,
+            use_adaptive_softadapt=False,
+            logmae_momentum=0,
+            initial_c_logmae=0.1,
+            fixed_weights_list=[1.0, best_msssim_weight, w_atv]
+        ).to(device)
+        
+        best_mape, _ = train_validate_model(
+            f"Tune_ATV_{w_atv}", model, train_loader, val_loader,
+            criterion, optimizer, num_epochs, device, calculate_mape
+        )
+        
+        results[f'ATV_{w_atv}'] = best_mape
+        improvement = "🏆 NEW CHAMPION!" if best_mape < champion_mape else f"({(best_mape-champion_mape)/champion_mape*100:+.1f}%)"
+        print(f"✓ Weights [1.0, {best_msssim_weight}, {w_atv}]: {best_mape:.4f}% MAPE {improvement}")
+    
+    # Find overall best result
+    overall_best = min(results.items(), key=lambda x: x[1])
+    overall_best_mape = overall_best[1]
+    
+    print("\n" + "="*80)
+    print("SYSTEMATIC WEIGHT TUNING RESULTS")
+    print("="*80)
+    print(f"Champion to beat: {champion_mape:.4f}% MAPE")
+    print("-" * 50)
+    
+    # Print Phase 1 results
+    print("Phase 1 - MS-SSIM Weight Tuning:")
+    for exp_name, mape in sorted(results.items(), key=lambda x: x[1]):
+        if 'MSSSIM' in exp_name:
+            w_val = exp_name.split('_')[1]
+            improvement = "🏆 NEW CHAMPION!" if mape < champion_mape else f"({(mape-champion_mape)/champion_mape*100:+.1f}%)"
+            print(f"  [1.0, {w_val}, 0.005]: {mape:.4f}% MAPE {improvement}")
+    
+    print("\nPhase 2 - ATV Weight Tuning:")
+    for exp_name, mape in sorted(results.items(), key=lambda x: x[1]):
+        if 'ATV' in exp_name:
+            w_val = exp_name.split('_')[1]
+            improvement = "🏆 NEW CHAMPION!" if mape < champion_mape else f"({(mape-champion_mape)/champion_mape*100:+.1f}%)"
+            print(f"  [1.0, {best_msssim_weight}, {w_val}]: {mape:.4f}% MAPE {improvement}")
+    
+    print(f"\n🏆 OVERALL BEST: {overall_best_mape:.4f}% MAPE")
+    if overall_best_mape < champion_mape:
+        improvement_pct = (champion_mape - overall_best_mape) / champion_mape * 100
+        print(f"🎉 NEW CHAMPION! {improvement_pct:.2f}% improvement over previous best!")
+    
+    print("="*80)
+    return results
+
+
+def run_refined_phase2_experiments(BaselineUNet, train_loader, val_loader, calculate_mape, device,
+                                  num_epochs=30, min_velocity=1.5):
+    """Run the complete refined Phase 2 experimental suite with all fixes and improvements.
+    
+    This includes:
+    1. Original experiments with bug fixes
+    2. Systematic weight tuning
+    3. Fixed curriculum learning
+    4. Improved SoftAdapt scaling
+    """
+    
+    print("="*80)
+    print("REFINED PHASE 2: COMPLETE EXPERIMENTAL SUITE")
+    print("All bugs fixed, systematic tuning implemented")
+    print("="*80)
+    
+    results = {}
+    LEARNING_RATE = 1e-4
+    WEIGHT_DECAY = 0.01
+    
+    # Experiment 1: Baseline comparison (FixedCLogSpaceMAE)
+    print("\n[1/6] 🔬 FixedCLogSpaceMAE (c=0.1) - Current Single-Component Champion")
+    model = BaselineUNet(5, 1).to(device)
+    optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
+    criterion = FixedCLogSpaceMAE(fixed_c=0.1, min_velocity=min_velocity).to(device)
+    
+    best_mape, _ = train_validate_model(
+        "Refined_FixedCLogMAE", model, train_loader, val_loader,
+        criterion, optimizer, num_epochs, device, calculate_mape
+    )
+    results['FixedCLogMAE_c0.1'] = best_mape
+    print(f"✓ FixedCLogMAE (c=0.1): {best_mape:.4f}% MAPE")
+    
+    # Experiment 2: Current hybrid champion weights
+    print("\n[2/6] 🔬 Hybrid Fixed Weights [1.0, 0.1, 0.005] - Current Overall Champion")
+    model = BaselineUNet(5, 1).to(device)
+    optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
+    criterion = RefinedLogSpaceMAEHybridLoss(
+        min_velocity=min_velocity,
+        use_adaptive_softadapt=False,
+        logmae_momentum=0,
+        initial_c_logmae=0.1,
+        fixed_weights_list=[1.0, 0.1, 0.005]
+    ).to(device)
+    
+    best_mape, _ = train_validate_model(
+        "Refined_HybridChampion", model, train_loader, val_loader,
+        criterion, optimizer, num_epochs, device, calculate_mape
+    )
+    results['HybridChampion_1.0_0.1_0.005'] = best_mape
+    print(f"✓ Hybrid Champion [1.0, 0.1, 0.005]: {best_mape:.4f}% MAPE")
+    
+    # Experiment 3: Systematic weight tuning
+    print("\n[3/6] 🔬 Systematic Weight Tuning Around Champion")
+    tuning_results = run_systematic_weight_tuning_experiments(
+        BaselineUNet, train_loader, val_loader, calculate_mape, device,
+        num_epochs=num_epochs//2, min_velocity=min_velocity, 
+        champion_mape=best_mape  # Use current best as target
+    )
+    results.update(tuning_results)
+    
+    # Experiment 4: Fixed curriculum learning (bug-fixed)
+    print("\n[4/6] 🔬 Fixed Curriculum Learning + SoftAdapt")
+    model = BaselineUNet(5, 1).to(device)
+    optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
+    criterion = RefinedLogSpaceMAEHybridLoss(
+        min_velocity=min_velocity,
+        use_adaptive_softadapt=True,
+        logmae_momentum=0,
+        initial_c_logmae=0.1,
+        start_simple=True,
+        curriculum_epochs=10,
+        component_scales="adaptive",  # Use refined adaptive scaling
+        softadapt_beta=0.1,
+        softadapt_update_freq=5
+    ).to(device)
+    
+    best_mape = train_with_curriculum_fixed(
+        "Refined_CurriculumSoftAdapt", model, train_loader, val_loader,
+        criterion, optimizer, num_epochs, device, calculate_mape
+    )
+    results['CurriculumSoftAdapt_Fixed'] = best_mape
+    print(f"✓ Fixed Curriculum + SoftAdapt: {best_mape:.4f}% MAPE")
+    
+    # Experiment 5: Improved scaled SoftAdapt (no curriculum)
+    print("\n[5/6] 🔬 Improved Scaled SoftAdapt (No Curriculum)")
+    model = BaselineUNet(5, 1).to(device)
+    optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
+    criterion = RefinedLogSpaceMAEHybridLoss(
+        min_velocity=min_velocity,
+        use_adaptive_softadapt=True,
+        logmae_momentum=0,
+        initial_c_logmae=0.1,
+        start_simple=False,
+        component_scales="adaptive",  # [15.0, 2.0, 50.0]
+        softadapt_beta=0.05,  # More responsive
+        softadapt_update_freq=8
+    ).to(device)
+    
+    best_mape, _ = train_validate_model(
+        "Refined_ScaledSoftAdapt", model, train_loader, val_loader,
+        criterion, optimizer, num_epochs, device, calculate_mape
+    )
+    results['ScaledSoftAdapt_Improved'] = best_mape
+    print(f"✓ Improved Scaled SoftAdapt: {best_mape:.4f}% MAPE")
+    
+    # Experiment 6: Conservative SoftAdapt (higher beta, more stable)
+    print("\n[6/6] 🔬 Conservative SoftAdapt (Higher Beta for Stability)")
+    model = BaselineUNet(5, 1).to(device)
+    optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
+    criterion = RefinedLogSpaceMAEHybridLoss(
+        min_velocity=min_velocity,
+        use_adaptive_softadapt=True,
+        logmae_momentum=0,
+        initial_c_logmae=0.1,
+        start_simple=False,
+        component_scales="adaptive",
+        softadapt_beta=0.2,  # More conservative
+        softadapt_update_freq=15
+    ).to(device)
+    
+    best_mape, _ = train_validate_model(
+        "Refined_ConservativeSoftAdapt", model, train_loader, val_loader,
+        criterion, optimizer, num_epochs, device, calculate_mape
+    )
+    results['ConservativeSoftAdapt'] = best_mape
+    print(f"✓ Conservative SoftAdapt: {best_mape:.4f}% MAPE")
+    
+    # Final analysis
+    print("\n" + "="*80)
+    print("REFINED PHASE 2 - FINAL RESULTS ANALYSIS")
+    print("="*80)
+    
+    # Find overall champion
+    overall_champion = min(results.items(), key=lambda x: x[1])
+    champion_name, champion_mape = overall_champion
+    
+    print(f"🏆 OVERALL CHAMPION: {champion_name}")
+    print(f"🎯 CHAMPION MAPE: {champion_mape:.4f}%")
+    
+    baseline_mape = 3.93  # Original baseline
+    improvement = (baseline_mape - champion_mape) / baseline_mape * 100
+    print(f"📈 IMPROVEMENT vs BASELINE: {improvement:.1f}%")
+    
+    print("\nComplete Results Ranking:")
+    for i, (exp_name, mape) in enumerate(sorted(results.items(), key=lambda x: x[1]), 1):
+        status = "👑 CHAMPION" if mape == champion_mape else f"  #{i}"
+        print(f"{status} {exp_name}: {mape:.4f}% MAPE")
+    
+    print("="*80)
+    return results
+
+
+def train_with_curriculum_fixed(experiment_name, model, train_loader, val_loader, criterion, optimizer,
+                               num_epochs, device, calculate_mape_func):
+    """Enhanced training function with proper curriculum learning and SoftAdapt handling."""
+    print(f"\n--- Starting Fixed Curriculum Experiment: {experiment_name} ---")
+    
+    best_val_mape = float('inf')
+    checkpoint_dir = "checkpoints"
+    if not os.path.exists(checkpoint_dir):
+        os.makedirs(checkpoint_dir)
+    
+    model_path = os.path.join(checkpoint_dir, f"{experiment_name}_best_mape.pth")
+    
+    for epoch in range(num_epochs):
+        # CRITICAL: Set epoch for curriculum learning
+        if hasattr(criterion, 'set_epoch'):
+            criterion.set_epoch(epoch)
+        
+        # Training phase
+        model.train()
+        running_train_loss = 0.0
+        
+        train_pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs} [Train]", leave=False)
+        for inputs, targets in train_pbar:
+            inputs, targets = inputs.to(device), targets.to(device)
+            optimizer.zero_grad()
+            outputs = model(inputs)
+            
+            # Handle both dict and scalar loss returns
+            loss_output = criterion(outputs, targets)
+            if isinstance(loss_output, dict):
+                loss = loss_output['total']
+            else:
+                loss = loss_output
+            
+            loss.backward()
+            optimizer.step()
+            running_train_loss += loss.item() * inputs.size(0)
+            train_pbar.set_postfix({'loss': loss.item()})
+        
+        # Validation phase
+        model.eval()
+        running_val_mape = 0.0
+        
+        val_pbar = tqdm(val_loader, desc=f"Epoch {epoch+1}/{num_epochs} [Val]", leave=False)
+        with torch.no_grad():
+            for inputs, targets in val_pbar:
+                inputs, targets_torch = inputs.to(device), targets.to(device)
+                outputs_torch = model(inputs)
+                
+                # Calculate MAPE
+                outputs_np = outputs_torch.squeeze(1).cpu().numpy()
+                targets_np = targets_torch.squeeze(1).cpu().numpy()
+                batch_mape_sum = 0.0
+                for i in range(outputs_np.shape[0]):
+                    batch_mape_sum += calculate_mape_func(targets_np[i], outputs_np[i])
+                running_val_mape += (batch_mape_sum / outputs_np.shape[0]) * inputs.size(0)
+        
+        epoch_train_loss = running_train_loss / len(train_loader.dataset)
+        epoch_val_mape = running_val_mape / len(val_loader.dataset)
+        
+        # Enhanced logging with curriculum and SoftAdapt info
+        print_msg = f"Epoch {epoch+1}/{num_epochs} | Train Loss: {epoch_train_loss:.6f} | Val MAPE: {epoch_val_mape:.4f}%"
+        
+        # Add curriculum phase indicator
+        if hasattr(criterion, 'start_simple') and criterion.start_simple:
+            if epoch < criterion.curriculum_epochs:
+                print_msg += " [CURRICULUM: LogMAE only]"
+            else:
+                print_msg += " [FULL HYBRID]"
+                
+                # Add SoftAdapt weights if available
+                if (hasattr(criterion, 'use_adaptive_softadapt_active') and 
+                    criterion.use_adaptive_softadapt_active and 
+                    hasattr(criterion, 'current_weights')):
+                    try:
+                        weights_str = ", ".join([f"{w:.3f}" for w in criterion.current_weights.cpu().numpy()])
+                        print_msg += f" | Weights: [{weights_str}]"
+                    except:
+                        print_msg += " | Weights: [updating...]"
+        
+        if epoch_val_mape < best_val_mape:
+            best_val_mape = epoch_val_mape
+            torch.save(model.state_dict(), model_path)
+            print_msg += " <<< BEST MAPE SO FAR - MODEL SAVED"
+        
+        print(print_msg)
+    
+    print(f"\nFinished {experiment_name}. Best Val MAPE: {best_val_mape:.4f}%")
+    return best_val_mape
+
+
 def run_phase2_experiments(BaselineUNet, SeismicDataset, train_loader, val_loader, calculate_mape, device, 
                           num_epochs=30, min_velocity=1.5):
     """Run complete Phase 2 experimental suite.
@@ -599,4 +1000,5 @@ def run_phase2_experiments(BaselineUNet, SeismicDataset, train_loader, val_loade
     return results_summary
 
 print("Phase 2 Experimental Framework loaded successfully!")
-print("Ready for systematic loss function experimentation.") 
+print("🔧 All critical bugs fixed, systematic tuning implemented")
+print("Ready for refined systematic loss function experimentation.") 
