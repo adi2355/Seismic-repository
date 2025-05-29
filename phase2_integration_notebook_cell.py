@@ -779,29 +779,21 @@ print()
 print("🏆 1. Validate Current Champion (A100 Stable):")
 print("   results = validate_champion_weights_a100_stable(num_epochs=20)")
 print()
-print("🥇 2. Test Champion Weight Variants (A100 Optimized - FIXED):")
-print("   results = test_champion_weight_variants_a100_fixed(num_epochs=25)")
+print("🥇 2. Test Champion Weight Variants (A100 Optimized):")
+print("   results = test_champion_weight_variants_a100(num_epochs=25)")
 print()
-print("🔬 3. Single Isolated Champion Test:")
-print("   results = validate_champion_single_isolated([1.0, 0.1, 0.005], num_epochs=25)")
-print()
-print("🔍 4. Quick A100 Diagnostic:")
+print("🔍 3. Quick A100 Diagnostic:")
 print("   results = diagnose_a100_issues_only()")
 print()
-print("🎯 5. Systematic Weight Tuning (A100 Compatible):")
+print("🎯 4. Systematic Weight Tuning (A100 Compatible):")
 print("   configure_a100_stability()  # Run first")
 print("   results = test_systematic_weight_tuning_only(num_epochs=15)")
 print()
-print("🧪 6. Test Fixed Curriculum Learning:")
+print("🧪 5. Test Fixed Curriculum Learning:")
 print("   results = test_fixed_curriculum_only(num_epochs=25)")
 print()
-print("🚀 7. Complete Refined Phase 2 Suite:")
+print("🚀 6. Complete Refined Phase 2 Suite:")
 print("   results = run_refined_phase2_experiments_integrated(num_epochs=30)")
-print()
-print("🔧 CRITICAL FIX: State Isolation Functions:")
-print("   ✓ reset_experiment_state() - Clears all caching between experiments")
-print("   ✓ test_champion_weight_variants_a100_fixed() - Proper experiment isolation")
-print("   ✓ validate_champion_single_isolated() - Single config with full reset")
 print()
 print("🔧 A100 GPU Optimizations Available:")
 print("   ✓ TF32 disable for FP32 precision")
@@ -834,27 +826,14 @@ print(f"Best Tuning Result: {best_tuning:.4f}% MAPE")
 print(f"Curriculum Learning: {curriculum_results['FixedCurriculum']:.4f}% MAPE")
 """ 
 
-def reset_experiment_state(seed=42):
-    """Reset all random states and clear GPU cache for reproducible experiments."""
-    # Set all random seeds
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-    np.random.seed(seed)
+def validate_absolute_champion_extended(num_epochs=45):
+    """Extended validation of the absolute champion configuration [1.0, 0.12, 0.007].
     
-    # Clear GPU cache
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-    
-    # Set deterministic behavior
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
-    
-    print(f"🔄 Experiment state reset with seed {seed}")
-
-def test_champion_weight_variants_a100_fixed(num_epochs=25):
-    """Fixed version with proper experiment isolation to ensure reproducible results."""
-    print("🏆 Testing champion weight variants with A100 stability (FIXED VERSION)...")
+    Confirms the 0.0997% MAPE breakthrough with longer training and 
+    checks for potential further improvements.
+    """
+    print("👑 Extended validation of ABSOLUTE CHAMPION [1.0, 0.12, 0.007]...")
+    print(f"🎯 Target: Confirm/improve upon 0.0997% MAPE breakthrough")
     
     # Configure A100 stability
     configure_a100_stability(disable_tf32=True, verbose=True)
@@ -863,104 +842,191 @@ def test_champion_weight_variants_a100_fixed(num_epochs=25):
     if not integrate_phase2_with_existing_notebook():
         return None
     
-    results = {}
-    
-    # Test original champion weights [1.0, 0.1, 0.005] with fresh state
-    print(f"\n[1/2] 🔬 Testing Original Champion [1.0, 0.1, 0.005] (ISOLATED)...")
-    
-    # CRITICAL: Reset state before each experiment
-    reset_experiment_state(seed=42)
-    
-    # Fresh data loaders for this experiment
-    train_loader1, val_loader1 = setup_phase2_data_loaders()
-    
-    model1 = BaselineUNet(5, 1).to(device)
-    optimizer1 = optim.AdamW(model1.parameters(), lr=1e-4, weight_decay=0.01)
-    criterion1 = RefinedLogSpaceMAEHybridLoss(
-        min_velocity=1.5, use_adaptive_softadapt=False, logmae_momentum=0,
-        initial_c_logmae=0.1, fixed_weights_list=[1.0, 0.1, 0.005]
-    ).to(device)
-    criterion1.seismic_ms_ssim = StabilizedSeismicMSSSIM(apply_log=True, data_range_log=2.0, c_for_log=0.1).to(device)
-    
-    best_mape1, _ = train_validate_model(
-        "A100_Fixed_Champion_Original", model1, train_loader1, val_loader1,
-        criterion1, optimizer1, num_epochs, device, calculate_mape
-    )
-    results['Original_Champion_1.0_0.1_0.005_FIXED'] = best_mape1
-    print(f"✓ Original Champion [1.0, 0.1, 0.005] FIXED: {best_mape1:.4f}% MAPE")
-    
-    # CRITICAL: Clear GPU and reset state before second experiment
-    del model1, optimizer1, criterion1, train_loader1, val_loader1
-    torch.cuda.empty_cache()
-    reset_experiment_state(seed=42)  # Same seed for fair comparison
-    
-    # Test systematic tuning best weights [1.0, 0.12, 0.007] with fresh state  
-    print(f"\n[2/2] 🔬 Testing Systematic Tuning Best [1.0, 0.12, 0.007] (ISOLATED)...")
-    
-    # Fresh data loaders for this experiment
-    train_loader2, val_loader2 = setup_phase2_data_loaders()
-    
-    model2 = BaselineUNet(5, 1).to(device)
-    optimizer2 = optim.AdamW(model2.parameters(), lr=1e-4, weight_decay=0.01)
-    criterion2 = RefinedLogSpaceMAEHybridLoss(
-        min_velocity=1.5, use_adaptive_softadapt=False, logmae_momentum=0,
-        initial_c_logmae=0.1, fixed_weights_list=[1.0, 0.12, 0.007]
-    ).to(device)
-    criterion2.seismic_ms_ssim = StabilizedSeismicMSSSIM(apply_log=True, data_range_log=2.0, c_for_log=0.1).to(device)
-    
-    best_mape2, _ = train_validate_model(
-        "A100_Fixed_Champion_Tuned", model2, train_loader2, val_loader2,
-        criterion2, optimizer2, num_epochs, device, calculate_mape
-    )
-    results['Tuned_Champion_1.0_0.12_0.007_FIXED'] = best_mape2
-    print(f"✓ Tuned Champion [1.0, 0.12, 0.007] FIXED: {best_mape2:.4f}% MAPE")
-    
-    # Determine absolute champion
-    absolute_champion = min(results.items(), key=lambda x: x[1])
-    champion_name, champion_mape = absolute_champion
-    
-    print("\n" + "="*60)
-    print("🏆 A100-STABLE CHAMPION COMPARISON (FIXED)")
-    print("="*60)
-    print(f"Original Champion [1.0, 0.1, 0.005]: {results['Original_Champion_1.0_0.1_0.005_FIXED']:.4f}% MAPE")
-    print(f"Tuned Champion [1.0, 0.12, 0.007]: {results['Tuned_Champion_1.0_0.12_0.007_FIXED']:.4f}% MAPE")
-    print(f"\n👑 ABSOLUTE CHAMPION: {champion_name}")
-    print(f"🎯 CHAMPION MAPE: {champion_mape:.4f}%")
-    
-    baseline_mape = 3.93
-    improvement = (baseline_mape - champion_mape) / baseline_mape * 100
-    print(f"📈 IMPROVEMENT vs BASELINE: {improvement:.1f}%")
-    print("="*60)
-    
-    return results
-
-def validate_champion_single_isolated(weights, num_epochs=25, experiment_name="Isolated_Test"):
-    """Validate a single weight configuration with complete isolation."""
-    print(f"🔬 Testing {weights} with complete isolation...")
-    
-    # Configure A100 stability
-    configure_a100_stability(disable_tf32=True, verbose=False)
-    
-    # Reset state
-    reset_experiment_state(seed=42)
-    
-    # Fresh data loaders
+    # Setup data loaders
     train_loader, val_loader = setup_phase2_data_loaders()
+    if train_loader is None or val_loader is None:
+        return None
     
-    # Fresh model and optimizer
+    print(f"🔬 Extended training with {num_epochs} epochs...")
+    
+    # Create model and optimizer  
     model = BaselineUNet(5, 1).to(device)
     optimizer = optim.AdamW(model.parameters(), lr=1e-4, weight_decay=0.01)
-    criterion = RefinedLogSpaceMAEHybridLoss(
-        min_velocity=1.5, use_adaptive_softadapt=False, logmae_momentum=0,
-        initial_c_logmae=0.1, fixed_weights_list=weights
-    ).to(device)
-    criterion.seismic_ms_ssim = StabilizedSeismicMSSSIM(apply_log=True, data_range_log=2.0, c_for_log=0.1).to(device)
     
-    # Run training
-    best_mape, history = train_validate_model(
-        experiment_name, model, train_loader, val_loader,
+    # Create ABSOLUTE CHAMPION hybrid loss
+    criterion = RefinedLogSpaceMAEHybridLoss(
+        min_velocity=1.5,
+        use_adaptive_softadapt=False,
+        logmae_momentum=0,  # Use fixed c=0.1 (best single component)
+        initial_c_logmae=0.1,
+        fixed_weights_list=[1.0, 0.12, 0.007]  # CHAMPION WEIGHTS
+    ).to(device)
+    
+    # Use StabilizedSeismicMSSSIM for A100 compatibility
+    criterion.seismic_ms_ssim = StabilizedSeismicMSSSIM(
+        apply_log=True, data_range_log=2.0, c_for_log=0.1
+    ).to(device)
+    
+    print("✓ Using CHAMPION configuration: [1.0, 0.12, 0.007]")
+    print("✓ Using StabilizedSeismicMSSSIM for A100 stability")
+    
+    # Pre-training diagnostic
+    print("\n🔍 Pre-training champion diagnostic:")
+    diagnose_loss_components(model, criterion, val_loader, device, num_batches=3)
+    
+    # Run extended training with checkpointing every 10 epochs
+    best_mape, history = train_validate_model_with_checkpoints(
+        "Extended_Absolute_Champion", model, train_loader, val_loader,
         criterion, optimizer, num_epochs, device, calculate_mape
     )
     
-    print(f"✓ {weights}: {best_mape:.4f}% MAPE")
-    return best_mape, history 
+    print(f"\n🏆 EXTENDED CHAMPION VALIDATION COMPLETE!")
+    print(f"🎯 Final MAPE: {best_mape:.4f}%")
+    
+    # Determine if we beat the 0.0997% target
+    target_mape = 0.0997
+    if best_mape < target_mape:
+        improvement = (target_mape - best_mape) / target_mape * 100
+        print(f"🎉 NEW RECORD! {improvement:.2f}% improvement over previous champion!")
+    elif best_mape <= target_mape * 1.05:  # Within 5%
+        print(f"✅ Confirmed champion performance (within 5% of target)")
+    else:
+        print(f"⚠️  Below target by {((best_mape - target_mape) / target_mape * 100):.1f}%")
+    
+    # Post-training diagnostic
+    print("\n🔍 Post-training champion diagnostic:")
+    diagnose_loss_components(model, criterion, val_loader, device, num_batches=3)
+    
+    # Enhanced results analysis
+    print("\n" + "="*60)
+    print("📈 CHAMPION PERFORMANCE ANALYSIS")
+    print("="*60)
+    baseline_mape = 3.93
+    improvement_vs_baseline = (baseline_mape - best_mape) / baseline_mape * 100
+    print(f"Baseline MAPE: {baseline_mape:.2f}%")
+    print(f"Champion MAPE: {best_mape:.4f}%")
+    print(f"Total Improvement: {improvement_vs_baseline:.1f}%")
+    print(f"Effective Reduction: {baseline_mape / best_mape:.1f}x better")
+    print("="*60)
+    
+    # Plot detailed results
+    plot_history(history, f"ABSOLUTE CHAMPION [1.0, 0.12, 0.007] - {best_mape:.4f}% MAPE")
+    
+    return {
+        'Extended_Champion_MAPE': best_mape, 
+        'history': history,
+        'improvement_vs_baseline': improvement_vs_baseline,
+        'beats_target': best_mape < target_mape
+    }
+
+def train_validate_model_with_checkpoints(experiment_name, model, train_loader, val_loader, criterion, 
+                                        optimizer, num_epochs, device, calculate_mape_func, 
+                                        checkpoint_freq=10):
+    """Enhanced training with regular checkpointing for long experiments."""
+    print(f"\n--- Starting Extended Experiment: {experiment_name} ---")
+    
+    best_val_mape = float('inf')
+    checkpoint_dir = "checkpoints"
+    if not os.path.exists(checkpoint_dir):
+        os.makedirs(checkpoint_dir)
+    
+    final_model_path = os.path.join(checkpoint_dir, f"{experiment_name}_best_mape.pth")
+    
+    history = {
+        'train_loss': [], 'val_mae': [], 'val_mape': [],
+        'val_logmae_loss': [], 'val_msssim_loss': [], 'val_atv_loss': [], 
+        'loss_weights': []
+    }
+
+    for epoch in range(num_epochs):
+        # Training Phase
+        model.train()
+        running_train_loss = 0.0
+        
+        train_pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs} [Train]", leave=False)
+        for inputs, targets in train_pbar:
+            inputs, targets = inputs.to(device), targets.to(device)
+            optimizer.zero_grad()
+            outputs = model(inputs)
+            
+            if isinstance(criterion, RefinedLogSpaceMAEHybridLoss):
+                loss_dict = criterion(outputs, targets)
+                loss = loss_dict['total']
+            else:
+                loss = criterion(outputs, targets)
+            
+            loss.backward()
+            optimizer.step()
+            running_train_loss += loss.item() * inputs.size(0)
+            train_pbar.set_postfix({'loss': loss.item()})
+
+        epoch_train_loss = running_train_loss / len(train_loader.dataset)
+        history['train_loss'].append(epoch_train_loss)
+
+        # Validation Phase
+        model.eval()
+        running_val_mae_orig_scale = 0.0
+        running_val_mape = 0.0
+        running_val_logmae_component = 0.0
+        running_val_msssim_component = 0.0
+        running_val_atv_component = 0.0
+        
+        val_pbar = tqdm(val_loader, desc=f"Epoch {epoch+1}/{num_epochs} [Val]", leave=False)
+        with torch.no_grad():
+            for inputs, targets in val_pbar:
+                inputs, targets_torch = inputs.to(device), targets.to(device)
+                outputs_torch = model(inputs)
+
+                # Calculate MAE on original scale
+                mae_orig = F.l1_loss(outputs_torch, targets_torch)
+                running_val_mae_orig_scale += mae_orig.item() * inputs.size(0)
+
+                # Calculate components if hybrid loss
+                if isinstance(criterion, RefinedLogSpaceMAEHybridLoss):
+                    val_loss_dict = criterion(outputs_torch, targets_torch)
+                    running_val_logmae_component += val_loss_dict['logmae'].item() * inputs.size(0)
+                    running_val_msssim_component += val_loss_dict['msssim'].item() * inputs.size(0)
+                    running_val_atv_component += val_loss_dict['atv'].item() * inputs.size(0)
+
+                # Calculate MAPE
+                outputs_np = outputs_torch.squeeze(1).cpu().numpy()
+                targets_np = targets_torch.squeeze(1).cpu().numpy()
+                batch_mape_sum = 0.0
+                for i in range(outputs_np.shape[0]):
+                    batch_mape_sum += calculate_mape_func(targets_np[i], outputs_np[i])
+                running_val_mape += (batch_mape_sum / outputs_np.shape[0]) * inputs.size(0)
+        
+        epoch_val_mae_orig = running_val_mae_orig_scale / len(val_loader.dataset)
+        epoch_val_mape = running_val_mape / len(val_loader.dataset)
+        history['val_mae'].append(epoch_val_mae_orig)
+        history['val_mape'].append(epoch_val_mape)
+
+        if isinstance(criterion, RefinedLogSpaceMAEHybridLoss):
+            history['val_logmae_loss'].append(running_val_logmae_component / len(val_loader.dataset))
+            history['val_msssim_loss'].append(running_val_msssim_component / len(val_loader.dataset))
+            history['val_atv_loss'].append(running_val_atv_component / len(val_loader.dataset))
+
+        print_msg = (f"Epoch {epoch+1}/{num_epochs} | Train Loss: {epoch_train_loss:.6f} | "
+                     f"Val MAE (Orig): {epoch_val_mae_orig:.6f} | Val MAPE: {epoch_val_mape:.4f}%")
+
+        if epoch_val_mape < best_val_mape:
+            best_val_mape = epoch_val_mape
+            torch.save(model.state_dict(), final_model_path)
+            print_msg += " <<< NEW BEST MAPE - MODEL SAVED"
+        
+        # Checkpoint every N epochs
+        if (epoch + 1) % checkpoint_freq == 0:
+            checkpoint_path = os.path.join(checkpoint_dir, f"{experiment_name}_epoch_{epoch+1}.pth")
+            torch.save({
+                'epoch': epoch + 1,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'best_mape': best_val_mape,
+                'history': history
+            }, checkpoint_path)
+            print_msg += f" | Checkpoint saved"
+        
+        print(print_msg)
+
+    print(f"\nExtended training complete! Best Val MAPE: {best_val_mape:.4f}%")
+    return best_val_mape, history
