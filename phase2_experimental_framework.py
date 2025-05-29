@@ -29,6 +29,197 @@ except ImportError:
 
 
 # =============================================================================
+# A100 GPU STABILIZATION AND DIAGNOSTIC FUNCTIONS
+# =============================================================================
+
+def configure_a100_stability(disable_tf32=True, set_deterministic=False, verbose=True):
+    """Configure A100 GPU for stable training with complex hybrid losses.
+    
+    Addresses numerical precision issues that can affect multi-component losses
+    when switching from L4/other GPUs to A100 Tensor Core architecture.
+    
+    Args:
+        disable_tf32: Disable TF32 for matmul and cuDNN (forces FP32 precision)
+        set_deterministic: Enable deterministic operations (slower but reproducible)
+        verbose: Print configuration details
+    """
+    if verbose:
+        print("="*60)
+        print("🔧 CONFIGURING A100 GPU STABILITY")
+        print("="*60)
+        print(f"GPU: {torch.cuda.get_device_name()}")
+        print(f"CUDA Version: {torch.version.cuda}")
+        print(f"PyTorch Version: {torch.__version__}")
+    
+    if disable_tf32:
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cudnn.allow_tf32 = False
+        if verbose:
+            print("✓ Disabled TF32 for matmul and cuDNN (forces FP32 precision)")
+    
+    if set_deterministic:
+        torch.manual_seed(42)
+        torch.cuda.manual_seed(42)
+        torch.backends.cudnn.benchmark = False
+        torch.backends.cudnn.deterministic = True
+        if hasattr(torch, 'use_deterministic_algorithms'):
+            try:
+                torch.use_deterministic_algorithms(True)
+                if verbose:
+                    print("✓ Enabled deterministic algorithms")
+            except Exception as e:
+                if verbose:
+                    print(f"⚠️  Could not enable deterministic algorithms: {e}")
+    
+    # Set optimized settings for complex losses
+    torch.backends.cudnn.enabled = True
+    if not set_deterministic:
+        torch.backends.cudnn.benchmark = True
+    
+    if verbose:
+        print("✓ A100 stability configuration complete")
+        print("="*60)
+
+def diagnose_loss_components(model, criterion, data_loader, device, num_batches=5):
+    """Diagnose loss component magnitudes and gradients for A100 troubleshooting.
+    
+    Args:
+        model: PyTorch model
+        criterion: Loss function (should be RefinedLogSpaceMAEHybridLoss)
+        data_loader: DataLoader for diagnosis
+        device: torch.device
+        num_batches: Number of batches to analyze
+    """
+    print("="*60)
+    print("🔍 DIAGNOSING LOSS COMPONENTS FOR A100")
+    print("="*60)
+    
+    model.eval()
+    component_stats = {'logmae': [], 'msssim': [], 'atv': [], 'total': []}
+    
+    with torch.no_grad():
+        for i, (inputs, targets) in enumerate(data_loader):
+            if i >= num_batches:
+                break
+                
+            inputs, targets = inputs.to(device), targets.to(device)
+            outputs = model(inputs)
+            
+            if hasattr(criterion, 'forward') and 'RefinedLogSpaceMAEHybridLoss' in str(type(criterion)):
+                loss_dict = criterion(outputs, targets)
+                
+                logmae_val = loss_dict['logmae'].item()
+                msssim_val = loss_dict['msssim'].item()
+                atv_val = loss_dict['atv'].item()
+                total_val = loss_dict['total'].item()
+                
+                component_stats['logmae'].append(logmae_val)
+                component_stats['msssim'].append(msssim_val)
+                component_stats['atv'].append(atv_val)
+                component_stats['total'].append(total_val)
+                
+                weights = loss_dict['weights']
+                
+                print(f"Batch {i+1}:")
+                print(f"  LogMAE: {logmae_val:.6f}")
+                print(f"  MS-SSIM: {msssim_val:.6f}")
+                print(f"  ATV: {atv_val:.6f}")
+                print(f"  Total: {total_val:.6f}")
+                print(f"  Weights: [{weights[0]:.3f}, {weights[1]:.3f}, {weights[2]:.3f}]")
+                print(f"  Ratios - MSSSIM/LogMAE: {msssim_val/logmae_val:.2f}, ATV/LogMAE: {atv_val/logmae_val:.2f}")
+                
+                # Check for numerical issues
+                if np.isnan(logmae_val) or np.isnan(msssim_val) or np.isnan(atv_val):
+                    print("  ⚠️  NaN detected in loss components!")
+                if np.isinf(logmae_val) or np.isinf(msssim_val) or np.isinf(atv_val):
+                    print("  ⚠️  Inf detected in loss components!")
+                print()
+    
+    # Summary statistics
+    print("📊 COMPONENT STATISTICS SUMMARY:")
+    for component, values in component_stats.items():
+        if values:
+            mean_val = np.mean(values)
+            std_val = np.std(values)
+            min_val = np.min(values)
+            max_val = np.max(values)
+            print(f"  {component.upper()}: mean={mean_val:.6f}, std={std_val:.6f}, min={min_val:.6f}, max={max_val:.6f}")
+    
+    print("="*60)
+    return component_stats
+
+
+class StabilizedSeismicMSSSIM(nn.Module):
+    """Enhanced SeismicMSSSIM with improved numerical stability for A100.
+    
+    Adds additional safeguards against precision issues that can occur
+    with TF32/FP16 arithmetic on Tensor Core GPUs.
+    """
+    def __init__(self, apply_log=True, data_range_log=2.0, min_velocity_for_log_norm=1.5, c_for_log=0.1):
+        super().__init__()
+        self.apply_log = apply_log
+        if MS_SSIM is not None:
+            self.ms_ssim_module = MS_SSIM(
+                data_range=data_range_log if apply_log else 6.5,
+                size_average=True,
+                channel=1
+            )
+        else:
+            raise ImportError("MS_SSIM not available. Install pytorch-msssim.")
+        self.min_velocity_for_log_norm = min_velocity_for_log_norm
+        self.c_for_log = c_for_log
+        self.epsilon_log = 1e-8
+        self.epsilon_norm = 1e-10  # Additional epsilon for A100 stability
+
+    def forward(self, vp_pred, vp_true):
+        if vp_pred.ndim == 3: vp_pred = vp_pred.unsqueeze(1)
+        if vp_true.ndim == 3: vp_true = vp_true.unsqueeze(1)
+
+        if self.apply_log:
+            # Enhanced clamping for A100 stability
+            vp_pred_safe = torch.clamp(vp_pred, min=self.min_velocity_for_log_norm, max=1e6)
+            vp_true_safe = torch.clamp(vp_true, min=self.min_velocity_for_log_norm, max=1e6)
+
+            # Force FP32 for sensitive log operations on A100
+            with torch.amp.autocast('cuda', enabled=False):
+                log_pred_raw = torch.log(vp_pred_safe.float() + self.c_for_log + self.epsilon_log)
+                log_true_raw = torch.log(vp_true_safe.float() + self.c_for_log + self.epsilon_log)
+
+                # Enhanced dynamic normalization with A100 stability
+                log_min_true_batch = torch.min(log_true_raw)
+                log_max_true_batch = torch.max(log_true_raw)
+                
+                # Additional stability check
+                range_val = log_max_true_batch - log_min_true_batch
+                if range_val < self.epsilon_norm:
+                    # Handle near-constant case more robustly
+                    log_pred_norm = torch.zeros_like(log_pred_raw)
+                    log_true_norm = torch.zeros_like(log_true_raw)
+                else:
+                    # Ensure normalization doesn't create extreme values
+                    range_val = torch.clamp(range_val, min=self.epsilon_norm)
+                    log_pred_norm = (log_pred_raw - log_min_true_batch) / range_val * self.ms_ssim_module.data_range
+                    log_true_norm = (log_true_raw - log_min_true_batch) / range_val * self.ms_ssim_module.data_range
+                    
+                    # Additional clamping for MS-SSIM input stability
+                    log_pred_norm = torch.clamp(log_pred_norm, 0, self.ms_ssim_module.data_range)
+                    log_true_norm = torch.clamp(log_true_norm, 0, self.ms_ssim_module.data_range)
+            
+            # MS-SSIM calculation with original precision
+            ms_ssim_val = self.ms_ssim_module(log_pred_norm, log_true_norm)
+            
+            # Additional stability check for MS-SSIM output
+            if torch.isnan(ms_ssim_val) or torch.isinf(ms_ssim_val):
+                print("⚠️  MS-SSIM produced NaN/Inf, returning fallback value")
+                return torch.tensor(0.5, device=vp_pred.device, dtype=vp_pred.dtype)
+            
+            return torch.clamp(1 - ms_ssim_val, min=0.0, max=2.0)
+        else:
+            ms_ssim_val = self.ms_ssim_module(vp_pred, vp_true)
+            return torch.clamp(1 - ms_ssim_val, min=0.0, max=2.0)
+
+
+# =============================================================================
 # ADVANCED LOSS FUNCTION IMPLEMENTATIONS
 # =============================================================================
 
@@ -459,13 +650,15 @@ def train_validate_model(experiment_name, model, train_loader, val_loader, crite
             history['val_logmae_loss'].append(running_val_logmae_component / len(val_loader.dataset))
             history['val_msssim_loss'].append(running_val_msssim_component / len(val_loader.dataset))
             history['val_atv_loss'].append(running_val_atv_component / len(val_loader.dataset))
-            if criterion.use_adaptive_softadapt:
+            if hasattr(criterion, 'use_adaptive_softadapt_active') and criterion.use_adaptive_softadapt_active:
                 history['loss_weights'].append(criterion.current_weights.cpu().numpy().copy())
 
         print_msg = (f"Epoch {epoch+1}/{num_epochs} | Train Loss: {epoch_train_loss:.6f} | "
                      f"Val MAE (Orig): {epoch_val_mae_orig:.6f} | Val MAPE: {epoch_val_mape:.4f}%")
         
-        if isinstance(criterion, RefinedLogSpaceMAEHybridLoss) and criterion.use_adaptive_softadapt:
+        if (isinstance(criterion, RefinedLogSpaceMAEHybridLoss) and 
+            hasattr(criterion, 'use_adaptive_softadapt_active') and 
+            criterion.use_adaptive_softadapt_active):
             weights_str = ", ".join([f"{w:.3f}" for w in criterion.current_weights.cpu().numpy()])
             print_msg += f" | Weights: [{weights_str}]"
 

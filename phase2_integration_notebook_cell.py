@@ -57,7 +57,7 @@ def integrate_phase2_with_existing_notebook():
     print("✓ All required components found")
     return True
 
-def setup_phase2_data_loaders(test_size=0.2, batch_size=4, num_workers=0, random_state=42):
+def setup_phase2_data_loaders(test_size=0.2, batch_size=8, num_workers=0, random_state=42):
     """Set up data loaders for Phase 2 experiments using your existing infrastructure."""
     
     if not all_sample_folder_paths:
@@ -585,6 +585,182 @@ def validate_champion_weights(num_epochs=20):
     
     return {'ChampionValidation': best_mape, 'history': history}
 
+def validate_champion_weights_a100_stable(num_epochs=20, disable_tf32=True):
+    """Validate champion hybrid weights [1.0, 0.1, 0.005] with A100 stability optimizations.
+    
+    Addresses numerical precision issues when running the hybrid champion loss
+    on A100 GPUs compared to L4 or other architectures.
+    """
+    print("🔧 Validating champion hybrid weights with A100 stability optimizations...")
+    
+    # Configure A100 stability FIRST
+    configure_a100_stability(disable_tf32=disable_tf32, verbose=True)
+    
+    # Verify integration
+    if not integrate_phase2_with_existing_notebook():
+        return None
+    
+    # Setup data loaders
+    train_loader, val_loader = setup_phase2_data_loaders()
+    if train_loader is None or val_loader is None:
+        return None
+    
+    print(f"🔬 Validating champion with {num_epochs} epochs (A100 optimized)...")
+    
+    # Create model and optimizer
+    model = BaselineUNet(5, 1).to(device)
+    optimizer = optim.AdamW(model.parameters(), lr=1e-4, weight_decay=0.01)
+    
+    # Create A100-stabilized champion hybrid loss
+    criterion = RefinedLogSpaceMAEHybridLoss(
+        min_velocity=1.5,
+        use_adaptive_softadapt=False,
+        logmae_momentum=0,  # Use fixed c=0.1 (best single component)
+        initial_c_logmae=0.1,
+        fixed_weights_list=[1.0, 0.1, 0.005]
+    ).to(device)
+    
+    # Replace SeismicMSSSIM with stabilized version
+    criterion.seismic_ms_ssim = StabilizedSeismicMSSSIM(
+        apply_log=True, data_range_log=2.0, c_for_log=0.1
+    ).to(device)
+    
+    print("✓ Using StabilizedSeismicMSSSIM for A100 compatibility")
+    
+    # Diagnostic check before training
+    print("\n🔍 Pre-training diagnostic check:")
+    diagnose_loss_components(model, criterion, val_loader, device, num_batches=3)
+    
+    # Run training
+    best_mape, history = train_validate_model(
+        "A100_Stable_Champion", model, train_loader, val_loader,
+        criterion, optimizer, num_epochs, device, calculate_mape
+    )
+    
+    print(f"\n✅ A100-stable champion validation completed!")
+    print(f"🎯 Validation MAPE: {best_mape:.4f}%")
+    
+    # Post-training diagnostic
+    print("\n🔍 Post-training diagnostic check:")
+    diagnose_loss_components(model, criterion, val_loader, device, num_batches=3)
+    
+    # Plot validation results
+    plot_history(history, "A100-Stable Champion [1.0, 0.1, 0.005]")
+    
+    return {'A100_StableChampion': best_mape, 'history': history}
+
+def test_champion_weight_variants_a100(num_epochs=25):
+    """Test the champion weight variants with A100 stability to find the absolute best configuration.
+    
+    Tests both [1.0, 0.1, 0.005] (original champion) and [1.0, 0.12, 0.007] (systematic tuning best)
+    with A100 optimizations to determine the true champion.
+    """
+    print("🏆 Testing champion weight variants with A100 stability...")
+    
+    # Configure A100 stability
+    configure_a100_stability(disable_tf32=True, verbose=True)
+    
+    # Verify integration
+    if not integrate_phase2_with_existing_notebook():
+        return None
+    
+    # Setup data loaders
+    train_loader, val_loader = setup_phase2_data_loaders()
+    if train_loader is None or val_loader is None:
+        return None
+    
+    results = {}
+    
+    # Test original champion weights [1.0, 0.1, 0.005]
+    print(f"\n[1/2] 🔬 Testing Original Champion [1.0, 0.1, 0.005]...")
+    
+    model1 = BaselineUNet(5, 1).to(device)
+    optimizer1 = optim.AdamW(model1.parameters(), lr=1e-4, weight_decay=0.01)
+    criterion1 = RefinedLogSpaceMAEHybridLoss(
+        min_velocity=1.5, use_adaptive_softadapt=False, logmae_momentum=0,
+        initial_c_logmae=0.1, fixed_weights_list=[1.0, 0.1, 0.005]
+    ).to(device)
+    criterion1.seismic_ms_ssim = StabilizedSeismicMSSSIM(apply_log=True, data_range_log=2.0, c_for_log=0.1).to(device)
+    
+    best_mape1, _ = train_validate_model(
+        "A100_Champion_Original", model1, train_loader, val_loader,
+        criterion1, optimizer1, num_epochs, device, calculate_mape
+    )
+    results['Original_Champion_1.0_0.1_0.005'] = best_mape1
+    print(f"✓ Original Champion [1.0, 0.1, 0.005]: {best_mape1:.4f}% MAPE")
+    
+    # Test systematic tuning best weights [1.0, 0.12, 0.007]
+    print(f"\n[2/2] 🔬 Testing Systematic Tuning Best [1.0, 0.12, 0.007]...")
+    
+    model2 = BaselineUNet(5, 1).to(device)
+    optimizer2 = optim.AdamW(model2.parameters(), lr=1e-4, weight_decay=0.01)
+    criterion2 = RefinedLogSpaceMAEHybridLoss(
+        min_velocity=1.5, use_adaptive_softadapt=False, logmae_momentum=0,
+        initial_c_logmae=0.1, fixed_weights_list=[1.0, 0.12, 0.007]
+    ).to(device)
+    criterion2.seismic_ms_ssim = StabilizedSeismicMSSSIM(apply_log=True, data_range_log=2.0, c_for_log=0.1).to(device)
+    
+    best_mape2, _ = train_validate_model(
+        "A100_Champion_Tuned", model2, train_loader, val_loader,
+        criterion2, optimizer2, num_epochs, device, calculate_mape
+    )
+    results['Tuned_Champion_1.0_0.12_0.007'] = best_mape2
+    print(f"✓ Tuned Champion [1.0, 0.12, 0.007]: {best_mape2:.4f}% MAPE")
+    
+    # Determine absolute champion
+    absolute_champion = min(results.items(), key=lambda x: x[1])
+    champion_name, champion_mape = absolute_champion
+    
+    print("\n" + "="*60)
+    print("🏆 A100-STABLE CHAMPION COMPARISON")
+    print("="*60)
+    print(f"Original Champion [1.0, 0.1, 0.005]: {results['Original_Champion_1.0_0.1_0.005']:.4f}% MAPE")
+    print(f"Tuned Champion [1.0, 0.12, 0.007]: {results['Tuned_Champion_1.0_0.12_0.007']:.4f}% MAPE")
+    print(f"\n👑 ABSOLUTE CHAMPION: {champion_name}")
+    print(f"🎯 CHAMPION MAPE: {champion_mape:.4f}%")
+    
+    baseline_mape = 3.93
+    improvement = (baseline_mape - champion_mape) / baseline_mape * 100
+    print(f"📈 IMPROVEMENT vs BASELINE: {improvement:.1f}%")
+    print("="*60)
+    
+    return results
+
+def diagnose_a100_issues_only():
+    """Quick diagnostic to check if A100 is causing issues with the hybrid loss."""
+    print("🔍 Quick A100 diagnostic for hybrid loss issues...")
+    
+    # Configure A100 stability
+    configure_a100_stability(disable_tf32=True, verbose=True)
+    
+    # Verify integration
+    if not integrate_phase2_with_existing_notebook():
+        return None
+    
+    # Setup data loaders
+    train_loader, val_loader = setup_phase2_data_loaders()
+    if train_loader is None or val_loader is None:
+        return None
+    
+    # Create model and hybrid loss
+    model = BaselineUNet(5, 1).to(device)
+    criterion = RefinedLogSpaceMAEHybridLoss(
+        min_velocity=1.5, use_adaptive_softadapt=False, logmae_momentum=0,
+        initial_c_logmae=0.1, fixed_weights_list=[1.0, 0.1, 0.005]
+    ).to(device)
+    
+    print("🔬 Testing standard SeismicMSSSIM:")
+    stats_standard = diagnose_loss_components(model, criterion, val_loader, device, num_batches=3)
+    
+    # Replace with stabilized version
+    criterion.seismic_ms_ssim = StabilizedSeismicMSSSIM(apply_log=True, data_range_log=2.0, c_for_log=0.1).to(device)
+    
+    print("🔬 Testing StabilizedSeismicMSSSIM:")
+    stats_stabilized = diagnose_loss_components(model, criterion, val_loader, device, num_batches=3)
+    
+    print("✅ A100 diagnostic complete!")
+    return {'standard': stats_standard, 'stabilized': stats_stabilized}
+
 # =============================================================================
 # ENHANCED READY-TO-USE EXPERIMENTAL COMMANDS
 # =============================================================================
@@ -596,29 +772,42 @@ print("🔧 Critical bugs fixed:")
 print("   ✓ Curriculum learning AttributeError resolved")
 print("   ✓ SoftAdapt scaling improved based on component analysis")
 print("   ✓ Enhanced error handling and initialization")
+print("   ✓ A100 GPU stability optimizations added")
 print()
 print("Available commands:")
 print()
-print("🏆 1. Validate Current Champion (Quick):")
-print("   results = validate_champion_weights(num_epochs=20)")
+print("🏆 1. Validate Current Champion (A100 Stable):")
+print("   results = validate_champion_weights_a100_stable(num_epochs=20)")
 print()
-print("🎯 2. Systematic Weight Tuning Only:")
+print("🥇 2. Test Champion Weight Variants (A100 Optimized - FIXED):")
+print("   results = test_champion_weight_variants_a100_fixed(num_epochs=25)")
+print()
+print("🔬 3. Single Isolated Champion Test:")
+print("   results = validate_champion_single_isolated([1.0, 0.1, 0.005], num_epochs=25)")
+print()
+print("🔍 4. Quick A100 Diagnostic:")
+print("   results = diagnose_a100_issues_only()")
+print()
+print("🎯 5. Systematic Weight Tuning (A100 Compatible):")
+print("   configure_a100_stability()  # Run first")
 print("   results = test_systematic_weight_tuning_only(num_epochs=15)")
 print()
-print("🧪 3. Test Fixed Curriculum Learning:")
+print("🧪 6. Test Fixed Curriculum Learning:")
 print("   results = test_fixed_curriculum_only(num_epochs=25)")
 print()
-print("🚀 4. Complete Refined Phase 2 Suite (Full):")
+print("🚀 7. Complete Refined Phase 2 Suite:")
 print("   results = run_refined_phase2_experiments_integrated(num_epochs=30)")
 print()
-print("⚡ 5. Quick Setup Test (Previous - Still Available):")
-print("   results = quick_test_phase2_setup()")
+print("🔧 CRITICAL FIX: State Isolation Functions:")
+print("   ✓ reset_experiment_state() - Clears all caching between experiments")
+print("   ✓ test_champion_weight_variants_a100_fixed() - Proper experiment isolation")
+print("   ✓ validate_champion_single_isolated() - Single config with full reset")
 print()
-print("🔧 Enhanced Loss Functions Available:")
-print("   ✓ RefinedLogSpaceMAEHybridLoss with proper curriculum support")
-print("   ✓ Systematic weight tuning around champion [1.0, 0.1, 0.005]")
-print("   ✓ Improved SoftAdapt scaling [15.0, 2.0, 50.0]")
-print("   ✓ Multiple SoftAdapt configurations (responsive, conservative)")
+print("🔧 A100 GPU Optimizations Available:")
+print("   ✓ TF32 disable for FP32 precision")
+print("   ✓ StabilizedSeismicMSSSIM with enhanced numerical stability")  
+print("   ✓ Loss component diagnostic tools")
+print("   ✓ Automatic precision handling for sensitive operations")
 print("="*60)
 
 # Example usage with refined experiments
@@ -644,3 +833,134 @@ best_tuning = min(tuning_results.values()) if tuning_results else float('inf')
 print(f"Best Tuning Result: {best_tuning:.4f}% MAPE") 
 print(f"Curriculum Learning: {curriculum_results['FixedCurriculum']:.4f}% MAPE")
 """ 
+
+def reset_experiment_state(seed=42):
+    """Reset all random states and clear GPU cache for reproducible experiments."""
+    # Set all random seeds
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    np.random.seed(seed)
+    
+    # Clear GPU cache
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    
+    # Set deterministic behavior
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    
+    print(f"🔄 Experiment state reset with seed {seed}")
+
+def test_champion_weight_variants_a100_fixed(num_epochs=25):
+    """Fixed version with proper experiment isolation to ensure reproducible results."""
+    print("🏆 Testing champion weight variants with A100 stability (FIXED VERSION)...")
+    
+    # Configure A100 stability
+    configure_a100_stability(disable_tf32=True, verbose=True)
+    
+    # Verify integration
+    if not integrate_phase2_with_existing_notebook():
+        return None
+    
+    results = {}
+    
+    # Test original champion weights [1.0, 0.1, 0.005] with fresh state
+    print(f"\n[1/2] 🔬 Testing Original Champion [1.0, 0.1, 0.005] (ISOLATED)...")
+    
+    # CRITICAL: Reset state before each experiment
+    reset_experiment_state(seed=42)
+    
+    # Fresh data loaders for this experiment
+    train_loader1, val_loader1 = setup_phase2_data_loaders()
+    
+    model1 = BaselineUNet(5, 1).to(device)
+    optimizer1 = optim.AdamW(model1.parameters(), lr=1e-4, weight_decay=0.01)
+    criterion1 = RefinedLogSpaceMAEHybridLoss(
+        min_velocity=1.5, use_adaptive_softadapt=False, logmae_momentum=0,
+        initial_c_logmae=0.1, fixed_weights_list=[1.0, 0.1, 0.005]
+    ).to(device)
+    criterion1.seismic_ms_ssim = StabilizedSeismicMSSSIM(apply_log=True, data_range_log=2.0, c_for_log=0.1).to(device)
+    
+    best_mape1, _ = train_validate_model(
+        "A100_Fixed_Champion_Original", model1, train_loader1, val_loader1,
+        criterion1, optimizer1, num_epochs, device, calculate_mape
+    )
+    results['Original_Champion_1.0_0.1_0.005_FIXED'] = best_mape1
+    print(f"✓ Original Champion [1.0, 0.1, 0.005] FIXED: {best_mape1:.4f}% MAPE")
+    
+    # CRITICAL: Clear GPU and reset state before second experiment
+    del model1, optimizer1, criterion1, train_loader1, val_loader1
+    torch.cuda.empty_cache()
+    reset_experiment_state(seed=42)  # Same seed for fair comparison
+    
+    # Test systematic tuning best weights [1.0, 0.12, 0.007] with fresh state  
+    print(f"\n[2/2] 🔬 Testing Systematic Tuning Best [1.0, 0.12, 0.007] (ISOLATED)...")
+    
+    # Fresh data loaders for this experiment
+    train_loader2, val_loader2 = setup_phase2_data_loaders()
+    
+    model2 = BaselineUNet(5, 1).to(device)
+    optimizer2 = optim.AdamW(model2.parameters(), lr=1e-4, weight_decay=0.01)
+    criterion2 = RefinedLogSpaceMAEHybridLoss(
+        min_velocity=1.5, use_adaptive_softadapt=False, logmae_momentum=0,
+        initial_c_logmae=0.1, fixed_weights_list=[1.0, 0.12, 0.007]
+    ).to(device)
+    criterion2.seismic_ms_ssim = StabilizedSeismicMSSSIM(apply_log=True, data_range_log=2.0, c_for_log=0.1).to(device)
+    
+    best_mape2, _ = train_validate_model(
+        "A100_Fixed_Champion_Tuned", model2, train_loader2, val_loader2,
+        criterion2, optimizer2, num_epochs, device, calculate_mape
+    )
+    results['Tuned_Champion_1.0_0.12_0.007_FIXED'] = best_mape2
+    print(f"✓ Tuned Champion [1.0, 0.12, 0.007] FIXED: {best_mape2:.4f}% MAPE")
+    
+    # Determine absolute champion
+    absolute_champion = min(results.items(), key=lambda x: x[1])
+    champion_name, champion_mape = absolute_champion
+    
+    print("\n" + "="*60)
+    print("🏆 A100-STABLE CHAMPION COMPARISON (FIXED)")
+    print("="*60)
+    print(f"Original Champion [1.0, 0.1, 0.005]: {results['Original_Champion_1.0_0.1_0.005_FIXED']:.4f}% MAPE")
+    print(f"Tuned Champion [1.0, 0.12, 0.007]: {results['Tuned_Champion_1.0_0.12_0.007_FIXED']:.4f}% MAPE")
+    print(f"\n👑 ABSOLUTE CHAMPION: {champion_name}")
+    print(f"🎯 CHAMPION MAPE: {champion_mape:.4f}%")
+    
+    baseline_mape = 3.93
+    improvement = (baseline_mape - champion_mape) / baseline_mape * 100
+    print(f"📈 IMPROVEMENT vs BASELINE: {improvement:.1f}%")
+    print("="*60)
+    
+    return results
+
+def validate_champion_single_isolated(weights, num_epochs=25, experiment_name="Isolated_Test"):
+    """Validate a single weight configuration with complete isolation."""
+    print(f"🔬 Testing {weights} with complete isolation...")
+    
+    # Configure A100 stability
+    configure_a100_stability(disable_tf32=True, verbose=False)
+    
+    # Reset state
+    reset_experiment_state(seed=42)
+    
+    # Fresh data loaders
+    train_loader, val_loader = setup_phase2_data_loaders()
+    
+    # Fresh model and optimizer
+    model = BaselineUNet(5, 1).to(device)
+    optimizer = optim.AdamW(model.parameters(), lr=1e-4, weight_decay=0.01)
+    criterion = RefinedLogSpaceMAEHybridLoss(
+        min_velocity=1.5, use_adaptive_softadapt=False, logmae_momentum=0,
+        initial_c_logmae=0.1, fixed_weights_list=weights
+    ).to(device)
+    criterion.seismic_ms_ssim = StabilizedSeismicMSSSIM(apply_log=True, data_range_log=2.0, c_for_log=0.1).to(device)
+    
+    # Run training
+    best_mape, history = train_validate_model(
+        experiment_name, model, train_loader, val_loader,
+        criterion, optimizer, num_epochs, device, calculate_mape
+    )
+    
+    print(f"✓ {weights}: {best_mape:.4f}% MAPE")
+    return best_mape, history 
