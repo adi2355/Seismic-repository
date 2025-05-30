@@ -187,7 +187,7 @@ class PerShotTemporalEncoder(nn.Module):
                  # 2D CNN aggregation parameters  
                  cnn_channels_list=[64, 128, 256], cnn_kernel_size=3,
                  # Output embedding dimension
-                 embedding_dim=128):
+                 embedding_dim=256):
         super().__init__()
         
         self.num_receivers = num_receivers
@@ -337,7 +337,7 @@ def test_sincnet_encoder():
         sinc_kernel_size=251,
         sinc_stride=50,
         sample_rate=1000,
-        embedding_dim=128
+        embedding_dim=256
     )
     
     print(f"Created encoder with {sum(p.numel() for p in encoder.parameters())} parameters")

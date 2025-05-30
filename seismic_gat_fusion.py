@@ -20,7 +20,7 @@ class LightweightGATFusion(nn.Module):
     """
     
     def __init__(self, 
-                 in_features=128,  # Changed from 256 to 128 - standardized
+                 in_features=256,  # Input from PerShotTemporalEncoder
                  gat_hidden_channels_per_head=32, 
                  num_heads=4,
                  gat_layers=1,  # Research showed 1 layer works well
@@ -32,13 +32,10 @@ class LightweightGATFusion(nn.Module):
         
         self.gat_layers_list = nn.ModuleList()
         self.layer_norms = nn.ModuleList()
-        self.residual_projections = nn.ModuleList()  # Add projections for dimension mismatches
         current_dim = in_features
         
         # Build GAT layers
         for i in range(gat_layers):
-            input_dim_to_layer = current_dim
-            
             self.gat_layers_list.append(
                 GATv2Conv(
                     in_channels=current_dim,
@@ -52,15 +49,6 @@ class LightweightGATFusion(nn.Module):
             )
             # Update dimension after concatenation of heads
             current_dim = gat_hidden_channels_per_head * num_heads
-            
-            # Add residual projection if dimensions don't match
-            if input_dim_to_layer != current_dim:
-                self.residual_projections.append(
-                    nn.Linear(input_dim_to_layer, current_dim)
-                )
-            else:
-                self.residual_projections.append(nn.Identity())
-            
             self.layer_norms.append(nn.LayerNorm(current_dim))
         
         self.feature_dropout = nn.Dropout(dropout_feat)
@@ -111,9 +99,9 @@ class LightweightGATFusion(nn.Module):
         """
         h = x_nodes
         
-        # Apply GAT layers with proper residual connections
-        for i, (gat_layer, layer_norm, residual_projection) in enumerate(zip(self.gat_layers_list, self.layer_norms, self.residual_projections)):
-            h_input = h  # Store input to this layer
+        # Apply GAT layers with residual connections
+        for i, (gat_layer, layer_norm) in enumerate(zip(self.gat_layers_list, self.layer_norms)):
+            h_prev = h
             
             # Feature dropout before GAT
             h = self.feature_dropout(h)
@@ -124,9 +112,11 @@ class LightweightGATFusion(nn.Module):
             # Activation
             h = self.activation(h)
             
-            # Residual connection with proper dimensionality handling
-            h_residual = residual_projection(h_input)  # Project input to match output dim
-            h = layer_norm(h + h_residual)  # Always add residual after projection
+            # Layer norm with residual connection (if dimensions match)
+            if h.size(-1) == h_prev.size(-1):
+                h = layer_norm(h + h_prev)
+            else:
+                h = layer_norm(h)
         
         # Global pooling to get graph-level embeddings
         graph_embeddings = self.readout_pooling(h, batch_vector)
@@ -220,123 +210,6 @@ class ShotGraphBuilder:
         return x_nodes, edge_index, batch_vector
 
 
-class SpatiallyAwareLightweightGATFusion(nn.Module):
-    """
-    Alternative GAT fusion that preserves spatial structure longer.
-    
-    Instead of global pooling, this outputs refined per-shot embeddings
-    that can be spatially arranged before decoding.
-    """
-    
-    def __init__(self, 
-                 in_features=128,
-                 gat_hidden_channels_per_head=32, 
-                 num_heads=4,
-                 gat_layers=1,
-                 dropout_feat=0.3,
-                 dropout_attn=0.6,
-                 output_embedding_dim=128):
-        super().__init__()
-        
-        self.gat_layers_list = nn.ModuleList()
-        self.layer_norms = nn.ModuleList()
-        self.residual_projections = nn.ModuleList()  # Add projections for dimension mismatches
-        current_dim = in_features
-        
-        # Build GAT layers
-        for i in range(gat_layers):
-            input_dim_to_layer = current_dim
-            
-            self.gat_layers_list.append(
-                GATv2Conv(
-                    in_channels=current_dim,
-                    out_channels=gat_hidden_channels_per_head,
-                    heads=num_heads,
-                    concat=True,
-                    dropout=dropout_attn,
-                    add_self_loops=True,
-                    bias=True
-                )
-            )
-            current_dim = gat_hidden_channels_per_head * num_heads
-            
-            # Add residual projection if dimensions don't match
-            if input_dim_to_layer != current_dim:
-                self.residual_projections.append(
-                    nn.Linear(input_dim_to_layer, current_dim)
-                )
-            else:
-                self.residual_projections.append(nn.Identity())
-            
-            self.layer_norms.append(nn.LayerNorm(current_dim))
-        
-        self.feature_dropout = nn.Dropout(dropout_feat)
-        self.activation = nn.ELU(inplace=True)
-        
-        # Per-shot refinement instead of global pooling
-        self.shot_refinement = nn.Linear(current_dim, output_embedding_dim)
-        
-        # Initialize weights
-        self._initialize_weights()
-    
-    def _initialize_weights(self):
-        """Initialize weights with appropriate scales"""
-        for m in self.modules():
-            if isinstance(m, nn.Linear):
-                nn.init.xavier_uniform_(m.weight, gain=1.414)
-                if m.bias is not None:
-                    nn.init.constant_(m.bias, 0)
-            elif isinstance(m, nn.LayerNorm):
-                nn.init.constant_(m.weight, 1)
-                nn.init.constant_(m.bias, 0)
-    
-    def forward(self, x_nodes, edge_index, batch_vector, num_shots=5):
-        """
-        Forward pass that preserves per-shot structure
-        
-        Args:
-            x_nodes: (Total_Nodes_in_Batch, in_features) - Node features
-            edge_index: (2, Num_Edges_Total) - Edge connectivity  
-            batch_vector: (Total_Nodes_in_Batch,) - Batch assignment for each node
-            num_shots: Number of shots per sample
-            
-        Returns:
-            shot_embeddings: (Batch_Size, num_shots, output_embedding_dim) - Per-shot refined embeddings
-        """
-        h = x_nodes
-        
-        # Apply GAT layers with residual connections
-        for i, (gat_layer, layer_norm, residual_projection) in enumerate(zip(self.gat_layers_list, self.layer_norms, self.residual_projections)):
-            h_prev = h
-            
-            # Feature dropout before GAT
-            h = self.feature_dropout(h)
-            
-            # GAT layer
-            h = gat_layer(h, edge_index)
-            
-            # Activation
-            h = self.activation(h)
-            
-            # Layer norm with residual connection (if dimensions match)
-            if h.size(-1) == h_prev.size(-1):
-                h = layer_norm(h + h_prev)
-            else:
-                h = layer_norm(h)
-            
-            # Apply residual projection if dimensions don't match
-            h = residual_projection(h)
-        
-        # Refine per-shot embeddings
-        refined_embeddings = self.shot_refinement(h)
-        
-        # Reshape to per-shot format: (B, num_shots, embedding_dim)
-        batch_size = batch_vector.max().item() + 1
-        shot_embeddings = refined_embeddings.view(batch_size, num_shots, -1)
-        
-        return shot_embeddings
-
-
 class SeismicSincNetGAT(nn.Module):
     """
     Complete seismic processing architecture combining SincNet and GAT.
@@ -354,14 +227,14 @@ class SeismicSincNetGAT(nn.Module):
                  sinc_kernel_size=251,
                  sinc_stride=50,
                  sample_rate=1000,
-                 shot_embedding_dim=128,  # FIXED: Consistent 128-dim
+                 shot_embedding_dim=256,
                  # GAT parameters
                  gat_hidden_per_head=32,
                  gat_num_heads=4,
                  gat_layers=1,
                  gat_dropout_feat=0.3,
                  gat_dropout_attn=0.6,
-                 final_embedding_dim=128,  # FIXED: Consistent with shot_embedding_dim
+                 final_embedding_dim=128,
                  # Graph structure
                  num_shots=5,
                  graph_connectivity='full'):
@@ -376,12 +249,12 @@ class SeismicSincNetGAT(nn.Module):
             sinc_kernel_size=sinc_kernel_size,
             sinc_stride=sinc_stride,
             sample_rate=sample_rate,
-            embedding_dim=shot_embedding_dim  # Now consistently 128
+            embedding_dim=shot_embedding_dim
         )
         
         # GAT fusion module
         self.gat_fusion = LightweightGATFusion(
-            in_features=shot_embedding_dim,  # FIXED: Now 128 to match encoder output
+            in_features=shot_embedding_dim,
             gat_hidden_channels_per_head=gat_hidden_per_head,
             num_heads=gat_num_heads,
             gat_layers=gat_layers,
@@ -468,10 +341,10 @@ def test_seismic_sincnet_gat():
     model = SeismicSincNetGAT(
         num_receivers=31,
         sinc_out_channels=40,
-        shot_embedding_dim=128,  # FIXED: Consistent 128-dim
+        shot_embedding_dim=256,
         gat_hidden_per_head=32,
         gat_num_heads=4,
-        final_embedding_dim=128,  # FIXED: Consistent with shot_embedding_dim
+        final_embedding_dim=128,
         num_shots=num_shots
     )
     
