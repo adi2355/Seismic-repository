@@ -111,7 +111,7 @@ class SincNetEnhancedSeismicModel(nn.Module):
                  # SincNet+GAT parameters
                  num_receivers=31,
                  sinc_out_channels=40,
-                 shot_embedding_dim=256,
+                 shot_embedding_dim=128,
                  gat_embedding_dim=128,
                  # Decoder parameters
                  target_height=300,
@@ -165,7 +165,7 @@ def create_champion_comparison():
     sincnet_model = SincNetEnhancedSeismicModel(
         num_receivers=31,
         sinc_out_channels=40,
-        shot_embedding_dim=256,
+        shot_embedding_dim=128,
         gat_embedding_dim=128
     )
     

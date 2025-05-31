@@ -10,10 +10,14 @@ class SincConv1d_SeismicAdapted(nn.Module):
     SincNet Convolution Layer adapted for seismic data processing.
     
     Key adaptations for seismic domain:
-    - Frequency range: 5-100 Hz (vs 85-3400 Hz in speech)
-    - Filters: 40 (vs 64-80 in speech) 
-    - Kernel size: 251 samples (maintained from speech for low-freq capture)
-    - Mel-scale initialization adapted for seismic frequency range
+    - Frequency range: 2-150 Hz (seismic reflection band)
+    - Sample rate: 500 Hz (2ms interval, based on Speed & Structure dataset research)
+    - Filters: 40 (optimized for seismic multi-shot processing)
+    - Kernel size: 251 samples (sufficient for low-frequency capture at 500Hz)
+    - Linear frequency initialization (vs. Mel-scale for speech)
+    
+    CRITICAL FIX: Proper sinc filter implementation using sin(2πft)/(2πft)
+    instead of torch.sinc() which computes sin(πx)/(πx).
     
     References:
     - Original SincNet: Ravanelli & Bengio (2018)
@@ -21,7 +25,7 @@ class SincConv1d_SeismicAdapted(nn.Module):
     """
     
     def __init__(self, in_channels, out_channels, kernel_size, stride=1, padding=0,
-                 sample_rate=1000, min_low_hz=5, min_band_hz=5, window_func='hamming'):
+                 sample_rate=500, min_low_hz=2, min_band_hz=3, window_func='hamming'):
         super().__init__()
         
         if in_channels != 1:
@@ -42,8 +46,8 @@ class SincConv1d_SeismicAdapted(nn.Module):
         self.low_hz_param = nn.Parameter(torch.Tensor(out_channels, 1))
         self.band_hz_param = nn.Parameter(torch.Tensor(out_channels, 1))
         
-        # Initialize using adapted Mel-scale for seismic frequencies (5-100 Hz)
-        self._initialize_seismic_mel_scale()
+        # Initialize using linear spacing for seismic frequencies (2-150 Hz)
+        self._initialize_seismic_linear_scale()
         
         # Pre-compute time vector for sinc function
         self.register_buffer('t_vect', self._get_time_vector())
@@ -58,36 +62,23 @@ class SincConv1d_SeismicAdapted(nn.Module):
         
         self.register_buffer('window', window.view(1, 1, -1))
     
-    def _initialize_seismic_mel_scale(self):
-        """Initialize frequencies using Mel-scale adapted for seismic range (5-100 Hz)"""
+    def _initialize_seismic_linear_scale(self):
+        """Initialize frequencies using linear spacing for seismic range (2-150 Hz)"""
         
-        def hz_to_mel(hz):
-            """Convert Hz to Mel scale"""
-            return 2595 * np.log10(1 + hz / 700)
-        
-        def mel_to_hz(mel):
-            """Convert Mel scale to Hz"""
-            return 700 * (10**(mel / 2595) - 1)
-        
-        # Seismic frequency range: 5-100 Hz
+        # Seismic frequency range: 2-150 Hz (linear spacing more appropriate than Mel)
         low_freq_hz = self.min_low_hz
-        high_freq_hz = min(100, self.sample_rate / 2 - 1)  # Cap at Nyquist
+        high_freq_hz = min(150, self.sample_rate / 2 - self.min_band_hz - 1)  # Cap at reasonable seismic max
         
-        # Convert to Mel scale
-        low_freq_mel = hz_to_mel(low_freq_hz)
-        high_freq_mel = hz_to_mel(high_freq_hz)
-        
-        # Create mel-spaced frequency points
-        mel_points = np.linspace(low_freq_mel, high_freq_mel, self.out_channels + 1)
-        hz_points = [mel_to_hz(mel) for mel in mel_points]
+        # Create linearly-spaced frequency points
+        freq_points = np.linspace(low_freq_hz, high_freq_hz, self.out_channels + 1)
         
         # Initialize learnable parameters
         low_hz_init = []
         band_hz_init = []
         
         for i in range(self.out_channels):
-            f_low = hz_points[i]
-            f_high = hz_points[i + 1]
+            f_low = freq_points[i]
+            f_high = freq_points[i + 1]
             
             # Parameterize relative to constraints for robust learning
             low_hz_init.append(f_low - self.min_low_hz)
@@ -100,7 +91,7 @@ class SincConv1d_SeismicAdapted(nn.Module):
     
     def _get_time_vector(self):
         """Compute time vector for sinc function"""
-        # Fix: Center the time vector around 0 with exactly kernel_size elements
+        # Center the time vector around 0 with exactly kernel_size elements
         n = (self.kernel_size - 1) // 2
         # Create symmetric time indices: [-n, -n+1, ..., -1, 0, 1, ..., n-1, n]
         time_indices = torch.arange(-n, n + 1, dtype=torch.float32)
@@ -126,6 +117,9 @@ class SincConv1d_SeismicAdapted(nn.Module):
         f_high = f_low + self.min_band_hz + torch.abs(self.band_hz_param)
         f_high = torch.clamp(f_high, max=self.sample_rate / 2 - 1)
         
+        # Ensure f_low doesn't exceed f_high
+        f_low = torch.clamp(f_low, max=f_high - self.min_band_hz)
+        
         # Generate bandpass sinc filters
         filters = self._generate_sinc_filters(f_low, f_high)
         
@@ -135,30 +129,50 @@ class SincConv1d_SeismicAdapted(nn.Module):
         return output
     
     def _generate_sinc_filters(self, f_low, f_high):
-        """Generate bandpass sinc filters"""
+        """
+        Generate bandpass sinc filters using correct sinc implementation.
         
-        # Convert frequencies to normalized form (cycles per sample)
-        f_low_norm = f_low / self.sample_rate  # Shape: (out_channels, 1)
+        CRITICAL FIX: Direct sin(2πft)/(2πft) calculation with proper normalization
+        """
+        
+        # Convert frequencies to normalized frequencies (relative to sample rate)
+        f_low_norm = f_low / self.sample_rate   # Shape: (out_channels, 1)
         f_high_norm = f_high / self.sample_rate  # Shape: (out_channels, 1)
         
-        # Compute sinc functions
-        # sinc(2πft) where t is time vector
-        # Need to broadcast: (out_channels, 1) * (1, 1, kernel_size) → (out_channels, 1, kernel_size)
+        # Time vector: (1, 1, kernel_size)
+        t_actual = self.t_vect  # Already in seconds
         
-        # Low-pass filter (high cutoff frequency)
-        sinc_high = torch.sinc(2 * f_high_norm.unsqueeze(-1) * self.t_vect.squeeze(0))  # (out_channels, 1, kernel_size)
+        # Compute sinc functions using direct sin(2πft)/(2πft) calculation
+        # Shape broadcasting: (out_channels, 1, 1) * (1, 1, kernel_size) → (out_channels, 1, kernel_size)
         
-        # Low-pass filter (low cutoff frequency)  
-        sinc_low = torch.sinc(2 * f_low_norm.unsqueeze(-1) * self.t_vect.squeeze(0))   # (out_channels, 1, kernel_size)
+        # For high cutoff frequency
+        arg_high = 2 * math.pi * f_high.unsqueeze(-1) * t_actual
+        # For low cutoff frequency  
+        arg_low = 2 * math.pi * f_low.unsqueeze(-1) * t_actual
+        
+        # Handle sinc(0) = 1 case (when t=0, arg=0)
+        # Create safe denominators to avoid division by zero
+        safe_arg_high = torch.where(torch.abs(arg_high) < 1e-8, torch.ones_like(arg_high), arg_high)
+        safe_arg_low = torch.where(torch.abs(arg_low) < 1e-8, torch.ones_like(arg_low), arg_low)
+        
+        # Compute sinc values: sinc(arg) = sin(arg)/arg
+        sinc_val_high = torch.sin(arg_high) / safe_arg_high
+        sinc_val_low = torch.sin(arg_low) / safe_arg_low
+        
+        # Low-pass filters: h(t) = 2*f_norm * sinc(2πf_norm*t)
+        low_pass_high = 2 * f_high_norm.unsqueeze(-1) * sinc_val_high
+        low_pass_low = 2 * f_low_norm.unsqueeze(-1) * sinc_val_low
         
         # Bandpass = high_cutoff_lowpass - low_cutoff_lowpass
-        bandpass_filters = sinc_high - sinc_low  # (out_channels, 1, kernel_size)
+        bandpass_filters_raw = low_pass_high - low_pass_low  # (out_channels, 1, kernel_size)
         
-        # Handle sinc(0) = 1 case for numerical stability
-        # When t=0, sinc(0) should be 1, but torch.sinc handles this
+        # Explicit center tap handling for numerical stability
+        center_index = (self.kernel_size - 1) // 2
+        center_tap_values = 2 * (f_high_norm - f_low_norm)  # At t=0: 2*(f_high - f_low)
+        bandpass_filters_raw[:, 0, center_index] = center_tap_values.squeeze(-1)
         
-        # Apply window function (e.g., Hamming) to reduce spectral leakage
-        windowed_filters = bandpass_filters * self.window  # (out_channels, 1, kernel_size) * (1, 1, kernel_size)
+        # Apply window function to reduce spectral leakage
+        windowed_filters = bandpass_filters_raw * self.window  # (out_channels, 1, kernel_size) * (1, 1, kernel_size)
         
         # Normalize filters (unit energy)
         filter_norms = torch.sqrt(torch.sum(windowed_filters**2, dim=2, keepdim=True))
@@ -183,11 +197,11 @@ class PerShotTemporalEncoder(nn.Module):
     def __init__(self, num_receivers=31,
                  # SincNet parameters
                  sinc_out_channels=40, sinc_kernel_size=251, sinc_stride=50, 
-                 sample_rate=1000, min_low_hz=5, min_band_hz=5,
+                 sample_rate=500, min_low_hz=2, min_band_hz=3,
                  # 2D CNN aggregation parameters  
                  cnn_channels_list=[64, 128, 256], cnn_kernel_size=3,
                  # Output embedding dimension
-                 embedding_dim=256):
+                 embedding_dim=128):
         super().__init__()
         
         self.num_receivers = num_receivers
@@ -210,6 +224,7 @@ class PerShotTemporalEncoder(nn.Module):
         
         # Calculate output time dimension after SincNet
         # For 'same' padding: output_length = (input_length + stride - 1) // stride
+        # With 10001 input samples, stride=50: (10001 + 50 - 1) // 50 = 10050 // 50 = 201
         self.time_reduced = (10001 + sinc_stride - 1) // sinc_stride
         
         # Layer normalization after SincNet (per trace)
@@ -336,8 +351,8 @@ def test_sincnet_encoder():
         sinc_out_channels=40,
         sinc_kernel_size=251,
         sinc_stride=50,
-        sample_rate=1000,
-        embedding_dim=256
+        sample_rate=500,
+        embedding_dim=128
     )
     
     print(f"Created encoder with {sum(p.numel() for p in encoder.parameters())} parameters")

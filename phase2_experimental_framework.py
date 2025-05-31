@@ -351,13 +351,15 @@ class RefinedLogSpaceMAEHybridLoss(nn.Module):
     1. Proper current_weights initialization for curriculum learning
     2. Improved pre-scaling for SoftAdapt based on observed component magnitudes
     3. Better curriculum transition logic
+    4. Use StabilizedSeismicMSSSIM for A100 compatibility
+    5. Correct champion weights [1.0, 0.12, 0.007]
     """
     def __init__(self, min_velocity=1.5, use_adaptive_softadapt=True,
                  initial_c_logmae=0.1, logmae_momentum=0.9,
                  ms_ssim_apply_log=True, ms_ssim_data_range_log=2.0, ms_ssim_c_log=0.1,
                  atv_weight_h=1.0, atv_weight_v=0.3,
                  softadapt_beta=0.1, softadapt_update_freq=10,
-                 fixed_weights_list=[1.0, 0.3, 0.005],
+                 fixed_weights_list=[1.0, 0.12, 0.007],  # Champion weights
                  # Enhanced parameters for refinement
                  scale_for_softadapt=True,
                  component_scales="adaptive",  # "adaptive" or list like [10.0, 1.0, 100.0]
@@ -365,19 +367,35 @@ class RefinedLogSpaceMAEHybridLoss(nn.Module):
                  start_simple=False):  # If True, start with only LogMAE
         super().__init__()
         
-        # Core loss components
-        self.adaptive_log_mae = AdaptiveLogSpaceMAE(
-            min_velocity=min_velocity, momentum=logmae_momentum, initial_c=initial_c_logmae
-        ) if logmae_momentum > 0 else FixedCLogSpaceMAE(
-            fixed_c=initial_c_logmae, min_velocity=min_velocity
+        # CRITICAL FIX: Use correct loss components based on momentum and stability requirements
+        if logmae_momentum > 0:
+            self.logmae_component = AdaptiveLogSpaceMAE(
+                min_velocity=min_velocity, momentum=logmae_momentum, initial_c=initial_c_logmae
+            )
+            logmae_type = "AdaptiveLogSpaceMAE"
+        else:
+            self.logmae_component = FixedCLogSpaceMAE(
+                fixed_c=initial_c_logmae, min_velocity=min_velocity
+            )
+            logmae_type = "FixedCLogSpaceMAE"
+        
+        # CRITICAL FIX: Use StabilizedSeismicMSSSIM for A100 compatibility
+        self.ms_ssim_component = StabilizedSeismicMSSSIM(
+            apply_log=ms_ssim_apply_log, data_range_log=ms_ssim_data_range_log, 
+            min_velocity_for_log_norm=min_velocity, c_for_log=ms_ssim_c_log
         )
         
-        self.seismic_ms_ssim = SeismicMSSSIM(
-            apply_log=ms_ssim_apply_log, data_range_log=ms_ssim_data_range_log, c_for_log=ms_ssim_c_log
-        )
-        self.anisotropic_tv = AnisotropicTotalVariationLoss(
+        self.anisotropic_tv_component = AnisotropicTotalVariationLoss(
             weight_h=atv_weight_h, weight_v=atv_weight_v
         )
+        
+        # Print configuration for debugging
+        print(f"🔧 RefinedLogSpaceMAEHybridLoss Configuration:")
+        print(f"   LogMAE: {logmae_type} (c={initial_c_logmae}, momentum={logmae_momentum})")
+        print(f"   MS-SSIM: StabilizedSeismicMSSSIM (apply_log={ms_ssim_apply_log})")
+        print(f"   ATV: weight_h={atv_weight_h}, weight_v={atv_weight_v}")
+        print(f"   Fixed weights: {fixed_weights_list}")
+        print(f"   SoftAdapt: {use_adaptive_softadapt}, curriculum: {start_simple} for {curriculum_epochs} epochs")
         
         # Refinement parameters
         self.scale_for_softadapt = scale_for_softadapt
@@ -387,7 +405,7 @@ class RefinedLogSpaceMAEHybridLoss(nn.Module):
         
         # Enhanced component scaling based on observed magnitudes from successful experiments
         if component_scales == "adaptive":
-            # Based on observed magnitudes from R2_FullHybrid_w0.1_0.005 (best result: 0.3790% MAPE)
+            # Based on observed magnitudes from champion experiments
             # Typical observed values: LogMAE ~0.03, MS-SSIM ~0.2, ATV ~0.05
             # Goal: bring them to similar order of magnitude for SoftAdapt
             self.component_scales = [15.0, 2.0, 50.0]  # Refined based on analysis
@@ -413,8 +431,9 @@ class RefinedLogSpaceMAEHybridLoss(nn.Module):
             )
             self.loss_history = {'logmae': [], 'msssim': [], 'atv': []}
             self.iteration = 0
+            print(f"✓ SoftAdapt initialized with beta={softadapt_beta}")
         elif self.config_use_adaptive_softadapt and LossWeightedSoftAdapt is None:
-            print("Warning: SoftAdapt requested but not available. Using fixed weights.")
+            print("⚠️  SoftAdapt requested but not available. Using fixed weights.")
             self.use_adaptive_softadapt_active = False
 
     def set_epoch(self, epoch):
@@ -445,8 +464,8 @@ class RefinedLogSpaceMAEHybridLoss(nn.Module):
                 self.use_adaptive_softadapt_active = False
 
     def forward(self, vp_pred, vp_target):
-        # Always compute LogMAE
-        logmae_val = self.adaptive_log_mae(vp_pred, vp_target)
+        # Always compute LogMAE using the correct component
+        logmae_val = self.logmae_component(vp_pred, vp_target)
         
         # Check if we're in curriculum phase (only LogMAE)
         if self.start_simple and self.epoch_counter < self.curriculum_epochs:
@@ -458,8 +477,8 @@ class RefinedLogSpaceMAEHybridLoss(nn.Module):
             }
         
         # Compute other components
-        msssim_val = self.seismic_ms_ssim(vp_pred, vp_target)
-        atv_val = self.anisotropic_tv(vp_pred)
+        msssim_val = self.ms_ssim_component(vp_pred, vp_target)
+        atv_val = self.anisotropic_tv_component(vp_pred)
 
         # SoftAdapt weight adaptation with improved scaling
         if self.use_adaptive_softadapt_active and self.training:
@@ -514,6 +533,10 @@ class RefinedLogSpaceMAEHybridLoss(nn.Module):
         else:
             weights_to_use = self.fixed_weights.to(vp_pred.device)
         
+        # CRITICAL FIX: Proper weighted combination
+        # fixed_weights[0] * LogMAE + fixed_weights[1] * (1-MS_SSIM) + fixed_weights[2] * ATV
+        # Note: ms_ssim_component already returns (1 - MS_SSIM) as loss
+        # Note: atv_component already applies internal weight_h and weight_v
         total_loss = (weights_to_use[0] * logmae_val +
                       weights_to_use[1] * msssim_val +
                       weights_to_use[2] * atv_val)

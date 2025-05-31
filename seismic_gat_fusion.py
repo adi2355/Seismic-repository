@@ -16,16 +16,16 @@ class LightweightGATFusion(nn.Module):
     - 1-2 GAT layers to avoid over-smoothing
     - 4 attention heads with 32-dim per head
     - GlobalAttention for better graph-level pooling
-    - Dropout for regularization (0.3 features, 0.6 attention)
+    - Dropout for regularization (0.3 features, 0.2-0.3 attention for small graphs)
     """
     
     def __init__(self, 
-                 in_features=256,  # Input from PerShotTemporalEncoder
+                 in_features=128,  # Input from PerShotTemporalEncoder
                  gat_hidden_channels_per_head=32, 
                  num_heads=4,
                  gat_layers=1,  # Research showed 1 layer works well
                  dropout_feat=0.3,
-                 dropout_attn=0.6,
+                 dropout_attn=0.2,  # CORRECTED: 0.2-0.3 optimal for small graphs (was 0.6)
                  output_embedding_dim=128,
                  use_global_attention=True):
         super().__init__()
@@ -226,14 +226,14 @@ class SeismicSincNetGAT(nn.Module):
                  sinc_out_channels=40,
                  sinc_kernel_size=251,
                  sinc_stride=50,
-                 sample_rate=1000,
-                 shot_embedding_dim=256,
+                 sample_rate=500,  # UPDATED: 500 Hz based on research
+                 shot_embedding_dim=128,
                  # GAT parameters
                  gat_hidden_per_head=32,
                  gat_num_heads=4,
                  gat_layers=1,
                  gat_dropout_feat=0.3,
-                 gat_dropout_attn=0.6,
+                 gat_dropout_attn=0.2,
                  final_embedding_dim=128,
                  # Graph structure
                  num_shots=5,
@@ -341,7 +341,10 @@ def test_seismic_sincnet_gat():
     model = SeismicSincNetGAT(
         num_receivers=31,
         sinc_out_channels=40,
-        shot_embedding_dim=256,
+        sinc_kernel_size=251,
+        sinc_stride=50,
+        sample_rate=500,
+        shot_embedding_dim=128,
         gat_hidden_per_head=32,
         gat_num_heads=4,
         final_embedding_dim=128,
