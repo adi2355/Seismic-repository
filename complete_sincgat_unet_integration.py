@@ -227,28 +227,34 @@ class GATUNetIntegration(nn.Module):
 
 class CompleteSincGAT_UNet(nn.Module):
     """
-    Complete SincNet-GAT-UNet architecture with proper sample rate configuration.
+    Complete SincNet-GAT-UNet architecture with optimized parameters from research.
     
-    This is the final model that integrates:
-    1. SincNet temporal encoding with configurable sample_rate
-    2. GAT multi-shot fusion
-    3. U-Net spatial modeling with GAT context injection
+    Architecture:
+    - Optimized SincNet encoders process each shot's traces (stride=1, 1001 kernel, 60 filters)
+    - GAT fusion combines shot embeddings considering spatial relationships
+    - Modified U-Net with GAT-fusion injection at bottleneck
     
-    Critical Fix: sample_rate is now properly set to 10001 Hz based on the dataset's sampling rate
+    Key improvements:
+    - Anti-aliasing with stride=1 (critical signal processing fix)
+    - Logarithmic filter spacing with 60 filters (better frequency coverage)
+    - 1001-point kernel (better low-frequency resolution)
+    - Blackman window (superior side-lobe suppression)
     """
-    
     def __init__(self, 
                  # Dataset-specific parameters (MUST be set correctly!)
                  sample_rate=10001,  # Hz - CRITICAL: Must match actual data sampling rate (10001 samples = 1 second)
                  num_receivers=31,
                  time_samples=10001,
                  num_shots=5,
-                 # SincNet parameters
-                 sinc_out_channels=40,
-                 sinc_kernel_size=251,
-                 sinc_stride=10,        # 🎯 FIXED: Use corrected stride=10 for anti-aliasing
-                 sinc_min_low_hz=80,   # Updated: Based on kernel size constraints
-                 sinc_min_band_hz=10,  # Updated: Larger minimum bandwidth
+                 # SincNet parameters (OPTIMIZED SETTINGS)
+                 sinc_out_channels=60,        # Increased from 40 to 60 (optimal for log spacing)
+                 sinc_kernel_size=1001,       # Increased from 251 to 1001 (better low-freq resolution)
+                 sinc_stride=1,               # CRITICAL: Use 1 to eliminate aliasing (was 10)
+                 sinc_min_low_hz=40,          # Lowered from 80 to 40 (captures more low frequencies)
+                 sinc_max_learnable_hz=1000,  # Upper limit at 1000Hz (where coherent signal ends)
+                 sinc_min_band_hz=10,         # Minimum bandwidth for a filter
+                 sinc_window_func='blackman', # Changed from hamming to blackman (better side-lobe suppression)
+                 sinc_init_type='logarithmic',# Added logarithmic spacing (better allocation across spectrum)
                  shot_embedding_dim=128,
                  # GAT parameters
                  gat_hidden_per_head=32,
@@ -264,74 +270,73 @@ class CompleteSincGAT_UNet(nn.Module):
                  fusion_ratio=0.25):
         super().__init__()
         
-        self.sample_rate = sample_rate
-        self.num_receivers = num_receivers
-        self.time_samples = time_samples
         self.num_shots = num_shots
+        self.sample_rate = sample_rate
+        self.time_samples = time_samples
+        self.num_receivers = num_receivers
+        self.shot_embedding_dim = shot_embedding_dim
         
-        # Create per-shot temporal encoders with FIXED anti-aliasing stride
-        self.temporal_encoders = nn.ModuleList()
-        for shot_idx in range(num_shots):
-            encoder = PerShotTemporalEncoder(
-                sample_rate=sample_rate,
-                num_receivers=num_receivers,
-                time_samples=time_samples,
-                sinc_out_channels=sinc_out_channels,
-                sinc_kernel_size=sinc_kernel_size,
-                sinc_stride=min(max(10, sinc_stride), 50),  # 🎯 ENFORCE: minimum 10, maximum 50 for safety
-                sinc_min_low_hz=sinc_min_low_hz,
-                sinc_min_band_hz=sinc_min_band_hz,
-                embedding_dim=shot_embedding_dim,
-                window_func='hamming'  # Can be changed to 'blackman' for better side-lobe suppression
-            )
-            self.temporal_encoders.append(encoder)
+        # Create SincNet encoders for temporal processing
+        self.shot_encoder = PerShotTemporalEncoder(
+            sample_rate=sample_rate,
+            num_receivers=num_receivers,
+            time_samples=time_samples,
+            sinc_out_channels=sinc_out_channels,
+            sinc_kernel_size=sinc_kernel_size,
+            sinc_stride=sinc_stride,            # CRITICAL FIX: stride=1 prevents aliasing
+            sinc_min_low_hz=sinc_min_low_hz,
+            sinc_max_learnable_hz=sinc_max_learnable_hz,
+            sinc_min_band_hz=sinc_min_band_hz,
+            sinc_window_func=sinc_window_func,
+            sinc_init_type=sinc_init_type,
+            embedding_dim=shot_embedding_dim
+        )
         
-        print(f"🎯 CRITICAL ALIASING FIX APPLIED:")
-        print(f"   Requested stride: {sinc_stride} → Applied stride: {min(max(10, sinc_stride), 50)}")
-        print(f"   Anti-aliasing: Hierarchical downsampling with proper filtering")
-        print(f"   Expected: Dramatic performance improvement from preserved frequency content")
+        # Graph builder to create shot-to-shot relationships
+        self.graph_builder = ShotGraphBuilder(num_shots)
         
         # GAT fusion module
         self.gat_fusion = LightweightGATFusion(
             in_features=shot_embedding_dim,
-            gat_hidden_channels_per_head=gat_hidden_per_head,
+            hidden_per_head=gat_hidden_per_head,
             num_heads=gat_num_heads,
-            gat_layers=gat_layers,
+            layers=gat_layers,
             dropout_feat=gat_dropout_feat,
             dropout_attn=gat_dropout_attn,
-            output_embedding_dim=fused_embedding_dim
+            output_dim=fused_embedding_dim
         )
         
-        # Graph builder for shot connectivity
-        self.graph_builder = ShotGraphBuilder(num_shots=num_shots, connectivity='full')
-        
-        # Baseline U-Net with encoder/decoder split
-        self.baseline_unet = BaselineUNet(
-            n_channels_in=num_shots,  # 5 shots as input channels
+        # Baseline U-Net for final velocity prediction
+        self.unet = BaselineUNet(
+            n_channels_in=num_shots,  # One channel per shot
             n_channels_out=n_unet_output_channels,
             bilinear=unet_bilinear
         )
         
-        # GAT-UNet integration module
-        self.gat_unet_integrator = GATUNetIntegration(
+        # Integration module to inject GAT-fused context into U-Net bottleneck
+        self.gat_unet_integration = GATUNetIntegration(
             C_bottleneck=unet_bottleneck_channels,
             F_fused_embedding=fused_embedding_dim,
             fusion_ratio=fusion_ratio
         )
         
-        # Initialize the model
         self._initialize_model()
-    
+        
+        print(f"🔧 CompleteSincGAT_UNet initialized")
+        print(f"   SincNet: {sinc_kernel_size}-point kernel, {sinc_out_channels} filters, stride={sinc_stride}, window={sinc_window_func}")
+        print(f"   Frequency range: {sinc_min_low_hz}-{sinc_max_learnable_hz} Hz ({sinc_init_type} spacing)")
+        print(f"   Total parameters: {sum(p.numel() for p in self.parameters()):,}")
+
     def _initialize_model(self):
         """Initialize model components"""
         print(f"🔧 Initializing CompleteSincGAT_UNet with sample_rate={self.sample_rate} Hz")
         
         # Count parameters
         total_params = sum(p.numel() for p in self.parameters())
-        sincnet_params = sum(p.numel() for p in self.temporal_encoders.parameters())
+        sincnet_params = sum(p.numel() for p in self.shot_encoder.parameters())
         gat_params = sum(p.numel() for p in self.gat_fusion.parameters())
-        unet_params = sum(p.numel() for p in self.baseline_unet.parameters())
-        integration_params = sum(p.numel() for p in self.gat_unet_integrator.parameters())
+        unet_params = sum(p.numel() for p in self.unet.parameters())
+        integration_params = sum(p.numel() for p in self.gat_unet_integration.parameters())
         
         print(f"📊 Parameter counts:")
         print(f"   SincNet Encoder: {sincnet_params:,}")
@@ -365,7 +370,7 @@ class CompleteSincGAT_UNet(nn.Module):
         shot_embeddings_list = []
         for i in range(self.num_shots):
             current_shot_data = x_all_shots_batch[:, i, :, :]  # (B, 10001, 31)
-            shot_embedding = self.temporal_encoders[i](current_shot_data)  # (B, shot_embedding_dim)
+            shot_embedding = self.shot_encoder(current_shot_data)  # (B, shot_embedding_dim)
             shot_embeddings_list.append(shot_embedding)
         
         # Stack embeddings: (B, num_shots, shot_embedding_dim)
@@ -380,13 +385,13 @@ class CompleteSincGAT_UNet(nn.Module):
         gat_fused_vector = self.gat_fusion(x_nodes, edge_index, batch_vector)  # (B, fused_embedding_dim)
         
         # 4. U-Net encoder path
-        x1, x2, x3, x4, x5 = self.baseline_unet.forward_encoder(x_all_shots_batch)
+        x1, x2, x3, x4, x5 = self.unet.forward_encoder(x_all_shots_batch)
         
         # 5. GAT-UNet integration at bottleneck
-        enhanced_bottleneck = self.gat_unet_integrator(x5, gat_fused_vector)
+        enhanced_bottleneck = self.gat_unet_integration(x5, gat_fused_vector)
         
         # 6. U-Net decoder path with enhanced bottleneck
-        velocity_models = self.baseline_unet.forward_decoder(enhanced_bottleneck, x4, x3, x2, x1)
+        velocity_models = self.unet.forward_decoder(enhanced_bottleneck, x4, x3, x2, x1)
         
         return velocity_models
 
@@ -444,11 +449,14 @@ def test_complete_model(sample_rate=10001, device='cuda' if torch.cuda.is_availa
         num_receivers=31,
         time_samples=10001,
         num_shots=5,
-        sinc_out_channels=40,
-        sinc_kernel_size=251,
-        sinc_stride=10,           # 🎯 FIXED: Use corrected stride=10 for anti-aliasing
-        sinc_min_low_hz=80,       # Updated min frequency
-        sinc_min_band_hz=10,      # Updated min bandwidth
+        sinc_out_channels=60,
+        sinc_kernel_size=1001,
+        sinc_stride=1,
+        sinc_min_low_hz=40,
+        sinc_max_learnable_hz=1000,
+        sinc_min_band_hz=10,
+        sinc_window_func='blackman',
+        sinc_init_type='logarithmic',
         shot_embedding_dim=128,
         gat_hidden_per_head=32,
         gat_num_heads=4,

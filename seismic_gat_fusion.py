@@ -21,12 +21,12 @@ class LightweightGATFusion(nn.Module):
     
     def __init__(self, 
                  in_features=128,  # Input from PerShotTemporalEncoder
-                 gat_hidden_channels_per_head=32, 
+                 hidden_per_head=32,  # Renamed from gat_hidden_channels_per_head
                  num_heads=4,
-                 gat_layers=1,  # Research showed 1 layer works well
+                 layers=1,  # Renamed from gat_layers
                  dropout_feat=0.3,
                  dropout_attn=0.2,  # CORRECTED: 0.2-0.3 optimal for small graphs (was 0.6)
-                 output_embedding_dim=128,
+                 output_dim=128,  # Renamed from output_embedding_dim
                  use_global_attention=True):
         super().__init__()
         
@@ -35,11 +35,11 @@ class LightweightGATFusion(nn.Module):
         current_dim = in_features
         
         # Build GAT layers
-        for i in range(gat_layers):
+        for i in range(layers):  # Using renamed parameter
             self.gat_layers_list.append(
                 GATv2Conv(
                     in_channels=current_dim,
-                    out_channels=gat_hidden_channels_per_head,
+                    out_channels=hidden_per_head,  # Using renamed parameter
                     heads=num_heads,
                     concat=True,  # Concatenate multi-head outputs
                     dropout=dropout_attn,
@@ -48,7 +48,7 @@ class LightweightGATFusion(nn.Module):
                 )
             )
             # Update dimension after concatenation of heads
-            current_dim = gat_hidden_channels_per_head * num_heads
+            current_dim = hidden_per_head * num_heads  # Using renamed parameter
             self.layer_norms.append(nn.LayerNorm(current_dim))
         
         self.feature_dropout = nn.Dropout(dropout_feat)
@@ -69,7 +69,7 @@ class LightweightGATFusion(nn.Module):
             self.readout_pooling = global_mean_pool
         
         # Final projection to desired output dimension
-        self.final_projection = nn.Linear(current_dim, output_embedding_dim)
+        self.final_projection = nn.Linear(current_dim, output_dim)  # Using renamed parameter
         
         # Initialize weights
         self._initialize_weights()
@@ -231,7 +231,7 @@ class SeismicSincNetGAT(nn.Module):
                  min_band_hz=10,      # UPDATED: Larger minimum bandwidth
                  shot_embedding_dim=128,
                  # GAT parameters
-                 gat_hidden_per_head=32,
+                 hidden_per_head=32,
                  gat_num_heads=4,
                  gat_layers=1,
                  gat_dropout_feat=0.3,
@@ -259,12 +259,12 @@ class SeismicSincNetGAT(nn.Module):
         # GAT fusion module
         self.gat_fusion = LightweightGATFusion(
             in_features=shot_embedding_dim,
-            gat_hidden_channels_per_head=gat_hidden_per_head,
+            hidden_per_head=hidden_per_head,
             num_heads=gat_num_heads,
-            gat_layers=gat_layers,
+            layers=gat_layers,
             dropout_feat=gat_dropout_feat,
             dropout_attn=gat_dropout_attn,
-            output_embedding_dim=final_embedding_dim
+            output_dim=final_embedding_dim
         )
         
         # Graph builder
@@ -351,7 +351,7 @@ def test_seismic_sincnet_gat():
         min_low_hz=80,      # Updated minimum frequency
         min_band_hz=10,     # Updated minimum bandwidth
         shot_embedding_dim=128,
-        gat_hidden_per_head=32,
+        hidden_per_head=32,
         gat_num_heads=4,
         final_embedding_dim=128,
         num_shots=num_shots

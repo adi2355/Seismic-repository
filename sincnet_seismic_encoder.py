@@ -9,431 +9,399 @@ class SincConv1d_SeismicAdapted(nn.Module):
     """
     SincNet Convolution Layer adapted for seismic data processing.
     
-    Key adaptations for seismic domain:
-    - Frequency range: Adaptively set based on sample_rate and kernel_size
-    - Sample rate: Configurable, with 10001 Hz for Speed & Structure dataset
-    - Filters: 40 (optimized for seismic multi-shot processing)
-    - Kernel size: 251 samples (considerations for frequency resolution)
-    - Linear frequency initialization (vs. Mel-scale for speech)
-    
-    CRITICAL FIX: Proper sinc filter implementation using sin(2πft)/(2πft)
-    instead of torch.sinc() which computes sin(πx)/(πx).
+    OPTIMIZED configuration based on detailed spectral analysis of 10001 Hz data:
+    - kernel_size=1001 for better low-frequency resolution (down to ~10-20 Hz)
+    - max_learnable_hz=1000 to match the spectral content of seismic signals
+    - stride=1 to eliminate aliasing (critical fix)
+    - Logarithmic filter spacing for better allocation of filters across frequencies
+    - Blackman window for superior side-lobe suppression
+    - 60 filters for optimal spectral coverage without redundancy
     
     References:
     - Original SincNet: Ravanelli & Bengio (2018)
     - Seismic adaptations based on domain-specific research
     """
     
-    def __init__(self, out_channels, kernel_size, sample_rate, in_channels=1, stride=10,  # CRITICAL FIX: stride=10
-                 padding=None, dilation=1, bias=False, groups=1, min_low_hz=80, min_band_hz=10,
-                 window_func='hamming', trainable_window=False, sample_normalization=True):
+    def __init__(self, 
+                 out_channels=60,        # Recommended: 60
+                 kernel_size=1001,       # Recommended: 1001
+                 sample_rate=10001,      # Should be 10001
+                 in_channels=1,          # Fixed
+                 stride=1,               # CRITICAL: Set to 1 (or very small like 2, 4)
+                 padding='same',         # Use 'same' for easier length calculation
+                 min_low_hz=40,          # Recommended: 40Hz (with kernel 1001) or 80Hz
+                 max_learnable_hz=1000,  # Recommended: 1000Hz
+                 min_band_hz=10,         # Min bandwidth for a filter
+                 window_func='blackman', # Recommended: 'blackman'
+                 initialization_type='logarithmic'): # Recommended: 'logarithmic'
         super().__init__()
-        
+
         if in_channels != 1:
-            raise ValueError("SincConv1d only supports in_channels=1")
-        
-        # Set padding for 'same' output if not specified
-        if padding is None:
-            padding = kernel_size // 2  # 'same' padding for odd kernel_size
-        
+            raise ValueError("SincConv1d_SeismicAdapted only supports in_channels=1")
+        if kernel_size % 2 == 0:
+            raise ValueError("kernel_size must be odd")
+
         self.out_channels = out_channels
         self.kernel_size = kernel_size
-        self.sample_rate = sample_rate
-        self.stride = stride  # Now 10 instead of 50 - preserves more temporal resolution
-        self.padding = padding
-        self.dilation = dilation
-        self.groups = groups
-        self.min_low_hz = min_low_hz
-        self.min_band_hz = min_band_hz
+        self.sample_rate = float(sample_rate) # Ensure float for division
+        self.stride = stride
+        self.min_low_hz = float(min_low_hz)
+        self.max_learnable_hz = float(max_learnable_hz)
+        self.min_band_hz = float(min_band_hz)
         self.window_func = window_func
-        self.trainable_window = trainable_window
-        self.sample_normalization = sample_normalization
+        self.initialization_type = initialization_type
         
-        # Validate parameters
-        if kernel_size % 2 == 0:
-            raise ValueError("SincConv1d kernel_size must be odd")
-        
-        # Initialize learnable frequency parameters
-        self._initialize_seismic_linear_scale()
-        
-        # Create window
-        self._create_window()
-        
-        print(f"🔧 SincConv1d_SeismicAdapted initialized:")
-        print(f"   Sample rate: {sample_rate} Hz")
-        print(f"   Kernel size: {kernel_size} samples ({kernel_size/sample_rate*1000:.1f} ms)")
-        print(f"   Padding: {padding} ('same' padding for consistent output size)")
-        print(f"   Stride: {stride} (FIXED - was 50, now {stride} to prevent aliasing)")
-        print(f"   Output sample rate: ~{sample_rate/stride:.0f} Hz")
-        print(f"   Effective Nyquist: ~{sample_rate/stride/2:.0f} Hz")
-        print(f"   Frequency range: {min_low_hz}-{self.max_learnable_hz:.0f} Hz")
-        print(f"   Window: {window_func}")
+        # Padding: 'same' will be handled by F.conv1d if padding arg is 'same'
+        # Or calculate manually: self.padding_val = (kernel_size - 1) // 2
+        if isinstance(padding, str) and padding.lower() == 'same':
+            self.padding_val = padding # Pass 'same' directly to F.conv1d
+        elif isinstance(padding, int):
+            self.padding_val = padding
+        else: # Default to manual 'same' calculation
+            self.padding_val = (kernel_size - 1) // 2
 
-    def _initialize_seismic_linear_scale(self):
-        """Initialize frequency parameters with seismic-appropriate scaling."""
-        # Calculate frequency limits based on kernel size and sample rate
-        nyquist_freq = self.sample_rate / 2.0
-        
-        # Minimum resolvable frequency (conservative estimate)
-        min_representable_hz = self.sample_rate / self.kernel_size
-        
-        # Effective max learnable frequency (conservative)
-        # Reduced slightly to ensure good filter shape
-        self.max_learnable_hz = min(nyquist_freq * 0.4, 300.0)  # Slightly higher ceiling
-        
-        # Ensure min_low_hz is reasonable
-        effective_min_low = max(self.min_low_hz, min_representable_hz)
-        
-        print(f"📊 SincNet frequency initialization:")
-        print(f"   Min representable: {min_representable_hz:.1f} Hz")
-        print(f"   Effective min_low: {effective_min_low:.1f} Hz") 
-        print(f"   Max learnable: {self.max_learnable_hz:.1f} Hz")
-        print(f"   Frequency range: {self.max_learnable_hz - effective_min_low:.1f} Hz")
-        
-        # Linear spacing of center frequencies
-        low_hz_init = np.linspace(
-            effective_min_low, 
-            self.max_learnable_hz - 2*self.min_band_hz,
-            self.out_channels
-        )
-        
-        # Band initialization - wider bands for better initial coverage
-        band_hz_init = np.full(self.out_channels, self.min_band_hz * 2.0)
-        
-        # Ensure no filter exceeds max frequency
-        for i in range(self.out_channels):
-            if low_hz_init[i] + band_hz_init[i] > self.max_learnable_hz:
-                band_hz_init[i] = self.max_learnable_hz - low_hz_init[i]
-        
-        # Convert to normalized frequencies [0, 1] where 1 = sample_rate/2
-        self.f_low = nn.Parameter(torch.tensor(low_hz_init / nyquist_freq, dtype=torch.float32))
-        self.band_hz = nn.Parameter(torch.tensor(band_hz_init / nyquist_freq, dtype=torch.float32))
-        
-        print(f"   Initialized {self.out_channels} filters")
-        print(f"   Low freq range: {low_hz_init.min():.1f}-{low_hz_init.max():.1f} Hz")
-        print(f"   Band range: {band_hz_init.min():.1f}-{band_hz_init.max():.1f} Hz")
+        # Learnable parameters for frequency bounds (normalized 0 to 0.5 of sample_rate)
+        # f_center_norm and f_bandwidth_norm
+        self.f_center_norm = nn.Parameter(torch.Tensor(out_channels, 1))
+        self.f_bandwidth_norm = nn.Parameter(torch.Tensor(out_channels, 1))
 
-    def _create_window(self):
-        """Create windowing function for filter design."""
-        n = self.kernel_size
+        self._initialize_filter_params()
+
+        # Pre-compute time vector for sinc function
+        self.register_buffer('t_vect', self._get_time_vector())
+        
+        # Pre-compute window function
         if self.window_func == 'hamming':
-            window = torch.hamming_window(n, periodic=False)
-        elif self.window_func == 'blackman':  # Better side-lobe suppression option
-            window = torch.blackman_window(n, periodic=False)
+            window = torch.hamming_window(kernel_size, periodic=False)
+        elif self.window_func == 'blackman':
+            window = torch.blackman_window(kernel_size, periodic=False)
         elif self.window_func == 'hann':
-            window = torch.hann_window(n, periodic=False)
-        else:
-            window = torch.ones(n)
+            window = torch.hann_window(kernel_size, periodic=False)
+        else: # Rectangular
+            window = torch.ones(kernel_size)
+        self.register_buffer('window', window.view(1, 1, -1))
+
+        print(f"🔧 SincConv1d_SeismicAdapted Initialized:")
+        print(f"   Sample Rate: {self.sample_rate} Hz")
+        print(f"   Kernel Size: {self.kernel_size} samples ({self.kernel_size/self.sample_rate*1000:.1f} ms)")
+        print(f"   Stride: {self.stride}")
+        print(f"   Filters: {self.out_channels}, Window: {self.window_func}")
+        print(f"   Target Freq. Range (init): [{self.min_low_hz:.1f} - {self.max_learnable_hz:.1f}] Hz ({self.initialization_type} spacing)")
+
+    def _initialize_filter_params(self):
+        nyquist = self.sample_rate / 2.0
+        min_representable_f_for_kernel = self.sample_rate / self.kernel_size # Approx. if 1 cycle in kernel
         
-        if self.trainable_window:
-            self.window = nn.Parameter(window)
-        else:
-            self.register_buffer('window', window)
+        actual_min_low_hz = max(self.min_low_hz, min_representable_f_for_kernel)
+        actual_max_learnable_hz = min(self.max_learnable_hz, nyquist - self.min_band_hz) # Ensure band fits
+
+        if actual_max_learnable_hz <= actual_min_low_hz:
+            raise ValueError(f"Invalid frequency range for SincNet: min_low_hz={actual_min_low_hz}, max_learnable_hz={actual_max_learnable_hz}")
+
+        center_freqs_hz = []
+        bandwidths_hz = []
+
+        if self.initialization_type == 'logarithmic':
+            # Ensure positive values for logspace
+            log_min = np.log10(max(1.0, actual_min_low_hz + self.min_band_hz / 2.0)) # Start slightly above min_low for center
+            log_max = np.log10(max(1.0, actual_max_learnable_hz - self.min_band_hz / 2.0)) # End slightly below max_learnable for center
+            if log_max <= log_min: # Fallback if range too small for log
+                 center_freqs_hz_init = np.linspace(actual_min_low_hz + self.min_band_hz/2, 
+                                                 actual_max_learnable_hz - self.min_band_hz/2, 
+                                                 self.out_channels)
+            else:
+                center_freqs_hz_init = np.logspace(log_min, log_max, self.out_channels)
+        else: # Linear
+            center_freqs_hz_init = np.linspace(actual_min_low_hz + self.min_band_hz/2.0, 
+                                             actual_max_learnable_hz - self.min_band_hz/2.0, 
+                                             self.out_channels)
+        
+        # Initialize bandwidths (e.g., as a fraction of center frequency or a fixed small value + min_band_hz)
+        for fc_hz in center_freqs_hz_init:
+            # Example: bandwidth proportional to center freq (constant Q-like), but at least min_band_hz
+            # For robust initialization, start with a slightly larger band than min_band_hz
+            bw_hz = max(self.min_band_hz, fc_hz * 0.1) # e.g. 10% of center freq
+            
+            # Ensure f_low and f_high are within limits
+            f_low_test = fc_hz - bw_hz / 2.0
+            f_high_test = fc_hz + bw_hz / 2.0
+
+            if f_low_test < actual_min_low_hz:
+                bw_hz = 2 * (fc_hz - actual_min_low_hz)
+            if f_high_test > actual_max_learnable_hz:
+                bw_hz = 2 * (actual_max_learnable_hz - fc_hz)
+            
+            bw_hz = max(bw_hz, self.min_band_hz) # Ensure min_band_hz
+
+            center_freqs_hz.append(fc_hz)
+            bandwidths_hz.append(bw_hz)
+
+        # Convert to normalized parameters (0 to 0.5) and initialize nn.Parameter
+        with torch.no_grad():
+            self.f_center_norm.data = torch.tensor(center_freqs_hz, dtype=torch.float32).view(-1,1) / self.sample_rate
+            self.f_bandwidth_norm.data = torch.tensor(bandwidths_hz, dtype=torch.float32).view(-1,1) / self.sample_rate
+
+    def _get_time_vector(self):
+        n = (self.kernel_size - 1) // 2
+        time_indices = torch.arange(-n, n + 1, dtype=torch.float32)
+        return time_indices.view(1, 1, -1)
+
+    def _get_current_cutoffs(self):
+        # Ensure parameters stay in valid ranges through clamping
+        f_c_norm = torch.abs(self.f_center_norm) 
+        f_bw_norm = torch.abs(self.f_bandwidth_norm)
+
+        # Ensure bandwidth is at least min_band_hz (normalized)
+        min_b_norm = self.min_band_hz / self.sample_rate
+        f_bw_norm = torch.clamp(f_bw_norm, min=min_b_norm)
+
+        f_low_norm = f_c_norm - f_bw_norm / 2.0
+        f_high_norm = f_c_norm + f_bw_norm / 2.0
+
+        # Clamp to [0, 0.5] (normalized Nyquist)
+        f_low_norm = torch.clamp(f_low_norm, min=0.0, max=0.5 - min_b_norm) # ensure high can be higher
+        
+        # Using torch.maximum/minimum for tensor bounds
+        min_bound = f_low_norm + min_b_norm
+        max_bound = torch.ones_like(f_high_norm) * 0.5
+        f_high_norm = torch.minimum(torch.maximum(f_high_norm, min_bound), max_bound)
+        
+        return f_low_norm, f_high_norm
 
     def _generate_sinc_filters(self):
-        """Generate sinc bandpass filters based on learned parameters."""
-        device = self.f_low.device
-        dtype = self.f_low.dtype
+        f_low_norm, f_high_norm = self._get_current_cutoffs()
         
-        # Ensure valid frequency parameters
-        f_low_clamped = torch.clamp(self.f_low, 0.0, 0.99)
-        band_hz_clamped = torch.clamp(self.band_hz, 0.01, 0.99)
+        # t_vect is now time indices: (1, 1, kernel_size)
+        # Frequencies are normalized (0 to 0.5)
+        # Argument for sinc: 2 * pi * f_norm * t_indices
+        t_indices = self.t_vect 
+
+        # First make sure f_low_norm and f_high_norm are properly shaped for broadcasting
+        # Should be (out_channels, 1, 1) for broadcasting with t_indices (1, 1, kernel_size)
+        f_low_norm = f_low_norm.view(self.out_channels, 1, 1)
+        f_high_norm = f_high_norm.view(self.out_channels, 1, 1)
+
+        # High-frequency sinc component
+        arg_high = 2 * math.pi * f_high_norm * t_indices
+        # Low-frequency sinc component
+        arg_low = 2 * math.pi * f_low_norm * t_indices
         
-        # High frequency is low + bandwidth
-        f_high = f_low_clamped + band_hz_clamped
-        f_high_clamped = torch.clamp(f_high, f_low_clamped + 0.01, 0.99)
+        safe_arg_high = torch.where(torch.abs(arg_high) < 1e-8, torch.ones_like(arg_high), arg_high)
+        safe_arg_low = torch.where(torch.abs(arg_low) < 1e-8, torch.ones_like(arg_low), arg_low)
         
-        # Time axis centered at zero
-        n = self.kernel_size
-        t = torch.arange(-(n//2), n//2 + 1, dtype=dtype, device=device).unsqueeze(0)
+        sinc_val_high = torch.sin(arg_high) / safe_arg_high
+        sinc_val_low = torch.sin(arg_low) / safe_arg_low
         
-        # Convert normalized frequencies to actual frequencies
-        f_low_hz = f_low_clamped * (self.sample_rate / 2.0)
-        f_high_hz = f_high_clamped * (self.sample_rate / 2.0)
+        # According to SincNet paper, filters are 2*f_high*sinc(2*pi*f_high*t) - 2*f_low*sinc(2*pi*f_low*t)
+        # where f_high and f_low are normalized frequencies
+        low_pass_high = 2 * f_high_norm * sinc_val_high
+        low_pass_low = 2 * f_low_norm * sinc_val_low
         
-        # Generate sinc filters: sinc(2πf_high*t) - sinc(2πf_low*t)
-        # Handle t=0 case separately to avoid division by zero
-        filters = torch.zeros(self.out_channels, n, dtype=dtype, device=device)
+        bandpass_filters_raw = low_pass_high - low_pass_low
         
-        # Non-zero time points
-        t_nonzero = t[:, t[0] != 0]
+        # Center tap (t=0)
+        center_idx = (self.kernel_size - 1) // 2
         
-        if t_nonzero.numel() > 0:
-            # High-frequency sinc
-            sinc_high = torch.sin(2 * np.pi * f_high_hz.unsqueeze(1) * t_nonzero) / (
-                np.pi * t_nonzero
-            )
-            
-            # Low-frequency sinc  
-            sinc_low = torch.sin(2 * np.pi * f_low_hz.unsqueeze(1) * t_nonzero) / (
-                np.pi * t_nonzero
-            )
-            
-            # Bandpass = high_sinc - low_sinc
-            filters[:, t[0] != 0] = sinc_high - sinc_low
+        # Handle center tap value for t=0 (L'Hôpital's rule)
+        # Calculate directly using broadcasting
+        center_diff = 2 * (f_high_norm - f_low_norm).squeeze(-1)  # Shape: (out_channels, 1)
+        bandpass_filters_raw[:, :, center_idx] = center_diff
         
-        # Handle t=0 case (limit as t->0)
-        zero_idx = n // 2
-        filters[:, zero_idx] = 2 * (f_high_hz - f_low_hz) / self.sample_rate
+        windowed_filters = bandpass_filters_raw * self.window
         
-        # Apply window
-        filters = filters * self.window.unsqueeze(0)
+        # Normalize filters (L2 norm per filter)
+        filter_norms = torch.norm(windowed_filters, p=2, dim=2, keepdim=True)
+        normalized_filters = windowed_filters / (filter_norms + 1e-8)
         
-        # Normalize filters
-        if self.sample_normalization:
-            # L2 normalization
-            filters = F.normalize(filters, p=2, dim=1)
-        
-        return filters.unsqueeze(1)  # Add input channel dimension
+        return normalized_filters # Shape (out_channels, 1, kernel_size)
 
     def forward(self, x):
-        """Forward pass through SincNet layer."""
         filters = self._generate_sinc_filters()
-        
-        return F.conv1d(
-            x, filters,
-            stride=self.stride,
-            padding=self.padding,
-            dilation=self.dilation,
-            groups=self.groups
-        )
+        # Input x: (B, 1, T_in)
+        # Filters: (C_out, 1, K)
+        output = F.conv1d(x, filters, stride=self.stride, padding=self.padding_val)
+        return output
 
 
-class TemporalAntiAliasingDownsample(nn.Module):
-    """
-    Advanced temporal anti-aliasing module focusing on the time dimension.
-    Implements 1D temporal filtering before downsampling as suggested in the analysis.
-    """
-    def __init__(self, channels, downsample_factor=2, filter_type='gaussian', filter_size=5):
+# Anti-Aliasing Modules
+class BlurPool1D(nn.Module):
+    """1D anti-aliasing module using binomial filter followed by strided subsampling"""
+    def __init__(self, channels, filt_size=3, stride=2):
         super().__init__()
-        self.downsample_factor = downsample_factor
-        self.filter_type = filter_type
-        
-        if filter_type == 'gaussian':
-            # Create 1D Gaussian filter for temporal anti-aliasing
-            self.temporal_blur = nn.Conv1d(
-                channels, channels,
-                kernel_size=filter_size,
-                stride=1,
-                padding=filter_size//2,
-                groups=channels,
-                bias=False
-            )
-            
-            # Initialize with Gaussian weights
-            with torch.no_grad():
-                sigma = 0.8  # Gaussian standard deviation
-                x = torch.arange(filter_size, dtype=torch.float32) - filter_size // 2
-                gaussian_kernel = torch.exp(-(x**2) / (2 * sigma**2))
-                gaussian_kernel = gaussian_kernel / gaussian_kernel.sum()
-                
-                for i in range(channels):
-                    self.temporal_blur.weight[i, 0] = gaussian_kernel
-                    
-        elif filter_type == 'learnable':
-            # Learnable 1D temporal filter
-            self.temporal_blur = nn.Conv1d(
-                channels, channels,
-                kernel_size=filter_size,
-                stride=1,
-                padding=filter_size//2,
-                groups=channels,
-                bias=False
-            )
-            # Will be learned during training
-            
-        else:  # 'box' filter (fallback)
-            self.temporal_blur = nn.Conv1d(
-                channels, channels,
-                kernel_size=filter_size,
-                stride=1,
-                padding=filter_size//2,
-                groups=channels,
-                bias=False
-            )
-            
-            with torch.no_grad():
-                box_kernel = torch.ones(filter_size) / filter_size
-                for i in range(channels):
-                    self.temporal_blur.weight[i, 0] = box_kernel
-        
-        # Freeze filter weights for non-learnable types
-        if filter_type != 'learnable':
-            self.temporal_blur.weight.requires_grad = False
-            
-    def forward(self, x):
-        # x: (B, C, T, R) - Apply temporal anti-aliasing along T dimension
-        B, C, T, R = x.shape
-        
-        # Reshape to apply 1D conv along temporal dimension
-        # (B, C, T, R) → (B*R, C, T)
-        x_temp = x.permute(0, 3, 1, 2).contiguous().view(B*R, C, T)
-        
-        # Apply temporal anti-aliasing filter
-        x_filtered = self.temporal_blur(x_temp)
-        
-        # Reshape back: (B*R, C, T) → (B, C, T, R)
-        x_filtered = x_filtered.view(B, R, C, T).permute(0, 2, 3, 1)
-        
-        # Downsample temporally only
-        x_downsampled = x_filtered[:, :, ::self.downsample_factor, :]
-        
-        return x_downsampled
+        self.channels = channels
+        self.filt_size = filt_size
+        self.stride = stride
+        self.padding = (filt_size - 1) // 2
 
+        # Simple binomial-like filter [0.25, 0.5, 0.25] for filt_size=3
+        # Or [1/16, 4/16, 6/16, 4/16, 1/16] for filt_size=5
+        if filt_size == 3:
+            a = torch.tensor([1., 2., 1.])
+        elif filt_size == 5:
+            a = torch.tensor([1., 4., 6., 4., 1.])
+        else: # Default to average/box for other sizes
+            a = torch.ones(filt_size)
+        
+        filt = (a / a.sum()).view(1, 1, filt_size).repeat(channels, 1, 1)
+        self.register_buffer('filt', filt)
 
-class AntiAliasingDownsample(nn.Module):
-    """
-    Anti-aliasing downsampling module to replace naive strided convolutions.
-    Implements proper low-pass filtering before downsampling.
-    """
-    def __init__(self, channels, downsample_factor=2, filter_size=5):
-        super().__init__()
-        self.downsample_factor = downsample_factor
-        
-        # Create anti-aliasing filter (simple Gaussian-based)
-        self.blur = nn.Conv2d(
-            channels, channels, 
-            kernel_size=filter_size,
-            stride=1,
-            padding=filter_size//2,
-            groups=channels,
-            bias=False
-        )
-        
-        # Initialize with Gaussian-like weights
-        with torch.no_grad():
-            # Simple box filter approximation for anti-aliasing
-            weight = torch.ones(filter_size, filter_size) / (filter_size * filter_size)
-            for i in range(channels):
-                self.blur.weight[i, 0] = weight
-        
-        # Freeze the anti-aliasing filter
-        self.blur.weight.requires_grad = False
-        
     def forward(self, x):
-        # Apply anti-aliasing filter
-        x = self.blur(x)
-        
+        # x shape: (Batch, Channels, Time)
+        # Apply depthwise convolution with the blur filter
+        blurred_x = F.conv1d(x, self.filt, stride=1, padding=self.padding, groups=self.channels)
         # Downsample
-        return x[:, :, ::self.downsample_factor, ::self.downsample_factor]
+        return blurred_x[:, :, ::self.stride]
+
+
+class BlurPool2D(nn.Module):
+    """2D anti-aliasing module using separable binomial filters followed by strided subsampling"""
+    def __init__(self, channels, filt_size=3, stride=(2,2)):
+        super().__init__()
+        self.channels = channels
+        self.filt_size = filt_size
+        self.stride_h, self.stride_w = stride if isinstance(stride, tuple) else (stride, stride)
+        self.padding = (filt_size - 1) // 2
+
+        if filt_size == 3:
+            a = torch.tensor([1., 2., 1.])
+        elif filt_size == 5:
+            a = torch.tensor([1., 4., 6., 4., 1.])
+        else:
+            a = torch.ones(filt_size)
+        
+        filt_h = (a / a.sum()).view(1, 1, filt_size, 1).repeat(channels, 1, 1, 1) # (C,1,k,1)
+        filt_w = (a / a.sum()).view(1, 1, 1, filt_size).repeat(channels, 1, 1, 1) # (C,1,1,k)
+
+        self.register_buffer('filt_h', filt_h)
+        self.register_buffer('filt_w', filt_w)
+
+    def forward(self, x):
+        # x shape: (Batch, Channels, Height, Width)
+        # Blur horizontally
+        blurred_x = F.conv2d(x, self.filt_w, stride=1, padding=(0, self.padding), groups=self.channels)
+        # Blur vertically
+        blurred_x = F.conv2d(blurred_x, self.filt_h, stride=1, padding=(self.padding, 0), groups=self.channels)
+        # Downsample
+        return blurred_x[:, :, ::self.stride_h, ::self.stride_w]
 
 
 class PerShotTemporalEncoder(nn.Module):
     """
-    FIXED VERSION: Implements hierarchical downsampling with anti-aliasing
-    to address temporal resolution bottleneck identified in analysis.
+    Optimized PerShotTemporalEncoder with:
+    1. Optimized SincNet parameters (kernel=1001, stride=1, max_hz=1000, log spacing)
+    2. Hierarchical anti-aliased downsampling for proper signal processing
+    3. Progressive reduction of temporal dimension without aliasing
     """
-    def __init__(self, sample_rate=10001, num_receivers=31, time_samples=10001,
-                 sinc_out_channels=40, sinc_kernel_size=251, sinc_stride=10,  # FIXED stride
-                 sinc_min_low_hz=80, sinc_min_band_hz=10,
-                 embedding_dim=128, window_func='hamming'):
+    def __init__(self, 
+                 sample_rate=10001,       # Must be 10001
+                 num_receivers=31,        # Fixed
+                 time_samples=10001,      # Fixed
+                 # SincNet Optimized Params
+                 sinc_out_channels=60,    # Recommended: 60
+                 sinc_kernel_size=1001,   # Recommended: 1001
+                 sinc_stride=1,           # CRITICAL: 1 (or very small, e.g., 2 or 4)
+                 sinc_min_low_hz=40,      # Recommended: 40Hz (with kernel 1001)
+                 sinc_max_learnable_hz=1000, # Recommended: 1000Hz
+                 sinc_min_band_hz=10,
+                 sinc_window_func='blackman',
+                 sinc_init_type='logarithmic',
+                 # CNN Aggregator Params
+                 cnn_channels_start=64,   # Channels for first 2D CNN layer
+                 cnn_depth=4,             # Number of CNN blocks
+                 cnn_temporal_pool_factors=[5, 5, 4, 2], # Factors for temporal downsampling at each CNN stage
+                 cnn_spatial_pool_factors=[2, 2, 2, 1], # Factors for spatial (receiver) downsampling
+                 embedding_dim=128):
         super().__init__()
         
-        print(f"🔧 PerShotTemporalEncoder FIXED VERSION:")
-        print(f"   Input: ({time_samples}, {num_receivers})")
-        print(f"   SincNet stride: {sinc_stride} (FIXED - prevents aliasing)")
+        self.num_receivers = num_receivers
         
-        # SincNet layer with FIXED stride
+        print(f"🔧 PerShotTemporalEncoder (HIERARCHICAL ANTI-ALIASED VERSION):")
+        print(f"   Input Time Samples: {time_samples}")
+        print(f"   SincNet Stride: {sinc_stride} (Output {time_samples // sinc_stride if sinc_stride > 0 else time_samples} temporal features if padding='same')")
+
         self.sinc_layer = SincConv1d_SeismicAdapted(
             out_channels=sinc_out_channels,
             kernel_size=sinc_kernel_size,
             sample_rate=sample_rate,
-            stride=sinc_stride,  # Now 10 instead of 50
+            stride=sinc_stride,
+            padding='same', # Ensures output length is input_length / stride
             min_low_hz=sinc_min_low_hz,
+            max_learnable_hz=sinc_max_learnable_hz,
             min_band_hz=sinc_min_band_hz,
-            window_func=window_func
+            window_func=sinc_window_func,
+            initialization_type=sinc_init_type
         )
         
-        # Calculate dimensions after SincNet
-        # With 'same' padding, output length = ceil(input_length / stride)
-        sinc_output_length = (time_samples + sinc_stride - 1) // sinc_stride
-        print(f"   After SincNet: ({sinc_output_length}, {num_receivers}) [with 'same' padding]")
+        sinc_output_temp_dim = math.ceil(time_samples / sinc_stride) if sinc_stride > 0 else time_samples
+        print(f"   SincNet Output Temporal Dim: {sinc_output_temp_dim}")
+
+        # CNN Aggregator with Hierarchical Anti-Aliased Downsampling
+        cnn_layers = []
+        current_sinc_channels = sinc_out_channels
+        current_temp_dim = sinc_output_temp_dim
+        current_spatial_dim = num_receivers
         
-        # HIERARCHICAL DOWNSAMPLING with anti-aliasing
-        # Goal: Reduce temporal dimension gradually while preserving information
+        current_cnn_channels = cnn_channels_start
+
+        for i in range(cnn_depth):
+            # Convolutional Block
+            cnn_layers.append(nn.Conv2d(current_sinc_channels if i == 0 else current_cnn_channels, 
+                                        current_cnn_channels * 2, # Double channels at each layer
+                                        kernel_size=3, padding=1))
+            cnn_layers.append(nn.GroupNorm(min(32, current_cnn_channels * 2 // 2), current_cnn_channels * 2))
+            cnn_layers.append(nn.ELU(inplace=True))
+            cnn_layers.append(nn.Dropout2d(0.1))
+            
+            prev_cnn_channels = current_cnn_channels
+            current_cnn_channels = current_cnn_channels * 2
+
+            # Anti-Aliased Pooling for this stage
+            t_pool = cnn_temporal_pool_factors[i]
+            s_pool = cnn_spatial_pool_factors[i]
+            
+            if t_pool > 1 or s_pool > 1:
+                # Using BlurPool2D for anti-aliased downsampling
+                cnn_layers.append(BlurPool2D(current_cnn_channels, filt_size=3, stride=(t_pool, s_pool)))
+                
+                current_temp_dim = math.ceil(current_temp_dim / t_pool)
+                current_spatial_dim = math.ceil(current_spatial_dim / s_pool)
+                print(f"   CNN Stage {i+1}: Pool ({t_pool}T, {s_pool}S) -> Temp Dim: {current_temp_dim}, Spatial Dim: {current_spatial_dim}, Channels: {current_cnn_channels}")
+
+        self.cnn_aggregator = nn.Sequential(*cnn_layers)
         
-        # Stage 1: Initial 2D convolution
-        self.conv1 = nn.Sequential(
-            nn.Conv2d(sinc_out_channels, 64, kernel_size=(3, 3), padding=(1, 1)),
-            nn.GroupNorm(8, 64),
-            nn.ELU(),
-            nn.Dropout2d(0.1)
-        )
+        self.global_pool = nn.AdaptiveAvgPool2d((1, 1)) # Pool to 1x1 spatially and temporally
         
-        # Stage 2: First downsampling (temporal factor 2) - IMPROVED ANTI-ALIASING
-        self.downsample1 = TemporalAntiAliasingDownsample(64, downsample_factor=2, filter_type='gaussian')
-        self.conv2 = nn.Sequential(
-            nn.Conv2d(64, 128, kernel_size=(3, 3), padding=(1, 1)),
-            nn.GroupNorm(16, 128),
-            nn.ELU(),
-            nn.Dropout2d(0.1)
-        )
-        
-        # Stage 3: Second downsampling (temporal factor 2) - IMPROVED ANTI-ALIASING  
-        self.downsample2 = TemporalAntiAliasingDownsample(128, downsample_factor=2, filter_type='gaussian')
-        self.conv3 = nn.Sequential(
-            nn.Conv2d(128, 256, kernel_size=(3, 3), padding=(1, 1)),
-            nn.GroupNorm(32, 256),
-            nn.ELU(),
-            nn.Dropout2d(0.1)
-        )
-        
-        # Stage 4: Adaptive pooling to final manageable size
-        target_temporal = max(8, sinc_output_length // 16)  # Reasonable final temporal dimension
-        target_spatial = max(4, num_receivers // 8)         # Reasonable final spatial dimension
-        
-        self.adaptive_pool = nn.AdaptiveAvgPool2d((target_temporal, target_spatial))
-        
-        # Final embedding layer
-        final_features = 256 * target_temporal * target_spatial
-        self.embedding_projection = nn.Sequential(
-            nn.Linear(final_features, embedding_dim * 2),
+        final_feature_dim = current_cnn_channels 
+        self.projection = nn.Sequential(
+            nn.Linear(final_feature_dim, embedding_dim * 2),
             nn.LayerNorm(embedding_dim * 2),
-            nn.ELU(),
+            nn.ELU(inplace=True),
             nn.Dropout(0.2),
             nn.Linear(embedding_dim * 2, embedding_dim)
         )
-        
-        print(f"   Hierarchical downsampling: {sinc_output_length} → {target_temporal}")
-        print(f"   IMPROVED: 1D Gaussian temporal anti-aliasing (preserves high-freq SincNet content)")
-        print(f"   Final embedding: {embedding_dim}")
-        print(f"   Total parameters: {sum(p.numel() for p in self.parameters()):,}")
 
-    def forward(self, shot_data):
-        # shot_data: (batch_size, time_samples, num_receivers)
-        batch_size = shot_data.shape[0]
+        print(f"   Final CNN Output Channels: {final_feature_dim}")
+        print(f"   Final Embedding Dim: {embedding_dim}")
+        self.apply(initialize_seismic_weights) # Initialize weights
+
+    def forward(self, x_shot_gather):
+        B, T, R = x_shot_gather.shape # (Batch, Time, Receivers)
         
-        # Apply SincNet along time dimension
-        # Reshape for 1D convolution: (batch_size * num_receivers, 1, time_samples)
-        num_receivers = shot_data.shape[2]
-        shot_reshaped = shot_data.transpose(1, 2).contiguous()  # (batch, receivers, time)
-        shot_reshaped = shot_reshaped.view(-1, 1, shot_data.shape[1])  # (batch*receivers, 1, time)
+        # Reshape for trace-wise SincNet: (B*R, 1, T)
+        x_traces = x_shot_gather.permute(0, 2, 1).contiguous().view(B * R, 1, T)
         
-        # SincNet processing
-        sinc_output = self.sinc_layer(shot_reshaped)  # (batch*receivers, sinc_channels, time_reduced)
+        sinc_features = self.sinc_layer(x_traces) # (B*R, sinc_C_out, T_sinc_out)
         
-        # Reshape back to 2D: (batch_size, sinc_channels, time_reduced, num_receivers)
-        sinc_channels, time_reduced = sinc_output.shape[1], sinc_output.shape[2]
-        sinc_output = sinc_output.view(batch_size, num_receivers, sinc_channels, time_reduced)
-        sinc_output = sinc_output.permute(0, 2, 3, 1)  # (batch, sinc_channels, time, receivers)
+        # Reshape for 2D CNN: (B, sinc_C_out, T_sinc_out, R)
+        sinc_C_out = sinc_features.shape[1]
+        T_sinc_out = sinc_features.shape[2]
+        cnn_input = sinc_features.view(B, R, sinc_C_out, T_sinc_out).permute(0, 2, 3, 1)
         
-        # Hierarchical 2D CNN processing with anti-aliasing
-        x = self.conv1(sinc_output)
+        # Pass through CNN aggregator
+        cnn_aggregated_features = self.cnn_aggregator(cnn_input)
         
-        x = self.downsample1(x)  # Anti-aliased downsampling
-        x = self.conv2(x)
-        
-        x = self.downsample2(x)  # Anti-aliased downsampling  
-        x = self.conv3(x)
-        
-        # Adaptive pooling to target size
-        x = self.adaptive_pool(x)
-        
-        # Global feature extraction
-        x = x.view(batch_size, -1)
-        
-        # Final embedding
-        embedding = self.embedding_projection(x)
+        pooled_features = self.global_pool(cnn_aggregated_features).view(B, -1)
+        embedding = self.projection(pooled_features)
         
         return embedding
 
@@ -458,11 +426,60 @@ def initialize_seismic_weights(module):
         nn.init.constant_(module.bias, 0)
 
 
-# Test function for development
+# Test function for the optimized implementation
+def test_fixed_sincnet_encoder():
+    print("🧪 Testing FIXED SincNet Seismic Encoder with Hierarchical Downsampling...")
+    batch_size = 2
+    time_samples = 10001
+    num_receivers = 31
+    dummy_shot = torch.randn(batch_size, time_samples, num_receivers)
+    print(f"Input shape: {dummy_shot.shape}")
+
+    encoder = PerShotTemporalEncoder(
+        sample_rate=10001,
+        num_receivers=num_receivers,
+        time_samples=time_samples,
+        sinc_out_channels=60,
+        sinc_kernel_size=1001,
+        sinc_stride=1, # CRITICAL: stride=1 prevents aliasing
+        sinc_min_low_hz=40,
+        sinc_max_learnable_hz=1000,
+        sinc_min_band_hz=10,
+        sinc_window_func='blackman',
+        sinc_init_type='logarithmic',
+        cnn_channels_start=32, # Start leaner for CNN
+        cnn_depth=4, # More depth to handle larger feature maps
+        cnn_temporal_pool_factors=[5, 5, 4, 2], # Product = 200. Total downsample = 1 * 200 = 200x. 10001/200 = ~50 features
+        cnn_spatial_pool_factors=[2, 2, 2, 1],   # Product = 8. Total 31/8 = ~3-4 features
+        embedding_dim=128
+    )
+    print(f"Encoder parameters: {sum(p.numel() for p in encoder.parameters()):,}")
+
+    try:
+        with torch.no_grad():
+            embedding = encoder(dummy_shot)
+            print(f"✅ Output embedding shape: {embedding.shape} (Expected: {batch_size, 128})")
+            assert embedding.shape == (batch_size, 128)
+            print(f"✅ Output embedding range: [{embedding.min():.3f}, {embedding.max():.3f}]")
+            if not (torch.isnan(embedding).any() or torch.isinf(embedding).any()):
+                print("✅ Output is numerically stable")
+            else:
+                print("❌ Output has NaN/Inf values!")
+    except Exception as e:
+        print(f"❌ Forward pass failed: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
+    
+    print("🎉 FIXED SincNet Seismic Encoder test completed successfully!")
+    return True
+
+
+# Legacy test function (keeping for backward compatibility)
 def test_sincnet_encoder():
     """Test the SincNet encoder with dummy data"""
     
-    print("🧪 Testing SincNet Seismic Encoder...")
+    print("🧪 Testing SincNet Seismic Encoder (LEGACY VERSION)...")
     
     # Create test data
     batch_size = 2
@@ -473,12 +490,13 @@ def test_sincnet_encoder():
     # Create encoder
     encoder = PerShotTemporalEncoder(
         num_receivers=31,
-        sinc_out_channels=40,
-        sinc_kernel_size=251,
-        sinc_stride=10,
-        sample_rate=10001,  # Updated sample rate
-        min_low_hz=80,      # Updated minimum frequency
-        min_band_hz=10,     # Updated minimum bandwidth
+        time_samples=10001,
+        sinc_out_channels=60,
+        sinc_kernel_size=1001,
+        sinc_stride=1,
+        sample_rate=10001,
+        sinc_min_low_hz=40,
+        sinc_max_learnable_hz=1000,
         embedding_dim=128
     )
     
@@ -503,28 +521,9 @@ def test_sincnet_encoder():
         print(f"❌ Forward pass failed: {e}")
         return False
     
-    # Test SincNet frequency parameters
-    sinc_layer = encoder.sinc_layer
-    with torch.no_grad():
-        f_low = sinc_layer.min_low_hz + torch.abs(sinc_layer.f_low)
-        f_high = f_low + sinc_layer.min_band_hz + torch.abs(sinc_layer.band_hz)
-        f_high = torch.clamp(f_high, max=sinc_layer.sample_rate / 2 - 1)
-        
-        # Calculate the minimum representable frequency
-        min_representable_hz = 2 * sinc_layer.sample_rate / sinc_layer.kernel_size
-        
-        print(f"✅ SincNet frequency information:")
-        print(f"   Sample rate: {sinc_layer.sample_rate} Hz")
-        print(f"   Kernel size: {sinc_layer.kernel_size} samples")
-        print(f"   Minimum representable frequency: {min_representable_hz:.1f} Hz")
-        print(f"   Configured min_low_hz: {sinc_layer.min_low_hz} Hz")
-        print(f"   Nyquist frequency: {sinc_layer.sample_rate/2:.1f} Hz")
-        print(f"   Learned f_low range: [{f_low.min():.1f}, {f_low.max():.1f}] Hz")
-        print(f"   Learned f_high range: [{f_high.min():.1f}, {f_high.max():.1f}] Hz")
-    
     print("🎉 SincNet Seismic Encoder test completed successfully!")
     return True
 
 
 if __name__ == "__main__":
-    test_sincnet_encoder() 
+    test_fixed_sincnet_encoder() 
