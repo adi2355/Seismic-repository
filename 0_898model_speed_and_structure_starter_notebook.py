@@ -55,6 +55,30 @@ import numpy as np
 from anytree import Node, RenderTree
 from typing import Dict, List
 
+# Essential imports for PyTorch and deep learning
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
+from sklearn.model_selection import train_test_split
+
+# Add imports for the Phase2 experimental framework and models
+try:
+    from phase2_experimental_framework import RefinedLogSpaceMAEHybridLoss
+    print("✅ Successfully imported RefinedLogSpaceMAEHybridLoss from phase2_experimental_framework")
+except ImportError:
+    print("⚠️ Could not import from phase2_experimental_framework - will define locally")
+    
+try:
+    from complete_sincgat_unet_integration import CompleteSincGAT_UNet, configure_a100_stability
+    print("✅ Successfully imported CompleteSincGAT_UNet and configure_a100_stability")
+except ImportError:
+    print("⚠️ Could not import from complete_sincgat_unet_integration - functionality may be limited")
+
+# Set device globally for the script
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+print(f"🎯 Global device set to: {device}")
 
 def dummy_prediction(input_data, output_shape):
     """
@@ -204,12 +228,12 @@ Let's assume that you have downloaded the train and test data, and organized the
 
 sketch_directory_tree()
 
-from google.colab import drive
-drive.mount('/content/drive')
+# from google.colab import drive
+# drive.mount('/content/drive')
 
-!cp -r /content/drive/MyDrive/speed-and-structure-train-data.zip /content/sample_data/
+# !cp -r /content/drive/MyDrive/speed-and-structure-train-data.zip /content/sample_data/
 
-!unzip /content/sample_data/speed-and-structure-train-data.zip -d /content/sample_data/dataset/
+# !unzip /content/sample_data/speed-and-structure-train-data.zip -d /content/sample_data/dataset/
 
 """
 Below, we begin by listing the sample IDs for the five samples included in the `train` folder. We then display the file names contained within the first sample directory.
@@ -705,7 +729,7 @@ if __name__ == '__main__': # Run only if script is executed directly
         import traceback
         traceback.print_exc()
 
-!pip install pytorch-msssim softadapt scikit-image
+# !pip install pytorch-msssim softadapt scikit-image
 
 # =============================================================================
 # PHASE 2 EXPERIMENTAL FRAMEWORK INTEGRATION
@@ -1658,14 +1682,14 @@ def test_sincgat_single_batch_overfit():
     
     print("🚀 Starting single batch overfitting test (100 iterations)...")
     
-        model.train()
+    model.train()
     losses = []
 
     for iteration in range(100):
-            optimizer.zero_grad()
-            outputs = model(inputs)
+        optimizer.zero_grad()
+        outputs = model(inputs)
 
-                loss_dict = criterion(outputs, targets)
+        loss_dict = criterion(outputs, targets)
         total_loss = loss_dict['total']
         
         total_loss.backward()
