@@ -1,12 +1,16 @@
 #!/usr/bin/env python3
 """
-Simple wrapper to run SincGAT FIXED curriculum training
+Simple wrapper to run SincGAT OPTIMIZED curriculum training
 
 USAGE:
     python run_sincgat_training.py
 
-This will run the latest SincGAT model with FIXED stride=10 (anti-aliasing fix)
-and curriculum learning approach.
+This will run the latest SincGAT model with OPTIMIZED parameters:
+- stride=1 (eliminates all aliasing)
+- kernel_size=1001 (better low-frequency resolution)
+- logarithmic filter spacing with 60 filters
+- blackman window with superior side-lobe suppression
+- hierarchical anti-aliased downsampling
 """
 
 import os
@@ -14,11 +18,11 @@ import sys
 
 def main():
     print("="*80)
-    print("🎯 SINCGAT FIXED CURRICULUM TRAINING LAUNCHER")
+    print("🎯 SINCGAT OPTIMIZED CURRICULUM TRAINING LAUNCHER")
     print("="*80)
-    print("🚨 CRITICAL ALIASING FIX IMPLEMENTED:")
-    print("   ❌ OLD: stride=50 → aliasing above 100Hz")
-    print("   ✅ NEW: stride=10 + hierarchical downsampling")
+    print("🚨 OPTIMIZED ARCHITECTURE IMPLEMENTED:")
+    print("   ❌ OLD: stride=50 → severe aliasing, hamming window, 40 filters")
+    print("   ✅ NEW: stride=1 + anti-aliased downsampling, 1001-point kernel, blackman window, 60 filters")
     print("   🎯 TARGET: Beat champion 0.0862% MAPE")
     print("="*80)
     
@@ -41,7 +45,7 @@ def main():
             # Get the function
             run_function = getattr(model_898, 'run_sincgat_FIXED_curriculum_training')
             
-            print("🚀 Starting SincGAT FIXED curriculum training...")
+            print("🚀 Starting SincGAT OPTIMIZED curriculum training...")
             print("   Using recommended parameters:")
             print("   - num_epochs: 50")
             print("   - curriculum_epochs: 10") 
@@ -74,6 +78,8 @@ def main():
         print("   - 0_898model_speed_and_structure_starter_notebook.py")
         print("   - phase2_experimental_framework.py")
         print("   - complete_sincgat_unet_integration.py")
+        print("   - sincnet_seismic_encoder.py")
+        print("   - seismic_gat_fusion.py")
         
     except Exception as e:
         print(f"❌ Error during execution: {e}")
