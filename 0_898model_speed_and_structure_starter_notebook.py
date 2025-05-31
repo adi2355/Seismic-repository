@@ -49,7 +49,7 @@ Kukreja, Navjot & Louboutin, Mathias & Lange, Michael & Luporini, Fabio & Gorman
 REMEMBER TO ADD YOUR PACKAGES TO the requirements.txt
 """
 
-pip install anytree
+# pip install anytree
 
 import numpy as np
 from anytree import Node, RenderTree
@@ -195,7 +195,7 @@ from utils import *
 
 """# Data
 
-You can download the train and test data from the challenge’s webpage or portal under the data tab.
+You can download the train and test data from the challenge's webpage or portal under the data tab.
 
 Let's assume that you have downloaded the train and test data, and organized them as shown in the tree below.
 
@@ -1082,6 +1082,111 @@ def train_with_curriculum(experiment_name, model, train_loader, val_loader, crit
 
     return best_val_mape
 
+def train_with_curriculum_fixed(experiment_name, model, train_loader, val_loader, criterion, optimizer,
+                               num_epochs, device, calculate_mape_func):
+    """Enhanced training function with proper curriculum learning and SoftAdapt handling.
+    
+    Key improvements over train_with_curriculum:
+    - Enhanced progress tracking with tqdm
+    - Better curriculum phase indicators
+    - Improved SoftAdapt weight logging
+    - More robust loss handling for complex architectures
+    """
+    print(f"\n--- Starting Fixed Curriculum Experiment: {experiment_name} ---")
+    
+    best_val_mape = float('inf')
+    checkpoint_dir = "checkpoints"
+    if not os.path.exists(checkpoint_dir):
+        os.makedirs(checkpoint_dir)
+    
+    model_path = os.path.join(checkpoint_dir, f"{experiment_name}_best_mape.pth")
+    
+    # Import tqdm for better progress tracking
+    try:
+        from tqdm import tqdm
+    except ImportError:
+        # Fallback if tqdm not available
+        def tqdm(iterable, desc="", leave=False):
+            return iterable
+    
+    for epoch in range(num_epochs):
+        # CRITICAL: Set epoch for curriculum learning
+        if hasattr(criterion, 'set_epoch'):
+            criterion.set_epoch(epoch)
+        
+        # Training phase
+        model.train()
+        running_train_loss = 0.0
+        
+        train_pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs} [Train]", leave=False)
+        for inputs, targets in train_pbar:
+            inputs, targets = inputs.to(device), targets.to(device)
+            optimizer.zero_grad()
+            outputs = model(inputs)
+            
+            # Handle both dict and scalar loss returns
+            loss_output = criterion(outputs, targets)
+            if isinstance(loss_output, dict):
+                loss = loss_output['total']
+            else:
+                loss = loss_output
+            
+            loss.backward()
+            optimizer.step()
+            running_train_loss += loss.item() * inputs.size(0)
+            train_pbar.set_postfix({'loss': loss.item()})
+        
+        # Validation phase
+        model.eval()
+        running_val_mape = 0.0
+        
+        val_pbar = tqdm(val_loader, desc=f"Epoch {epoch+1}/{num_epochs} [Val]", leave=False)
+        with torch.no_grad():
+            for inputs, targets in val_pbar:
+                inputs, targets_torch = inputs.to(device), targets.to(device)
+                outputs_torch = model(inputs)
+                
+                # Calculate MAPE
+                outputs_np = outputs_torch.squeeze(1).cpu().numpy()
+                targets_np = targets_torch.squeeze(1).cpu().numpy()
+                batch_mape_sum = 0.0
+                for i in range(outputs_np.shape[0]):
+                    batch_mape_sum += calculate_mape_func(targets_np[i], outputs_np[i])
+                running_val_mape += (batch_mape_sum / outputs_np.shape[0]) * inputs.size(0)
+        
+        epoch_train_loss = running_train_loss / len(train_loader.dataset)
+        epoch_val_mape = running_val_mape / len(val_loader.dataset)
+        
+        # Enhanced logging with curriculum and SoftAdapt info
+        print_msg = f"Epoch {epoch+1}/{num_epochs} | Train Loss: {epoch_train_loss:.6f} | Val MAPE: {epoch_val_mape:.4f}%"
+        
+        # Add curriculum phase indicator
+        if hasattr(criterion, 'start_simple') and criterion.start_simple:
+            if epoch < criterion.curriculum_epochs:
+                print_msg += " [CURRICULUM: LogMAE only]"
+            else:
+                print_msg += " [FULL HYBRID]"
+                
+                # Add SoftAdapt weights if available
+                if (hasattr(criterion, 'use_adaptive_softadapt_active') and 
+                    criterion.use_adaptive_softadapt_active and 
+                    hasattr(criterion, 'current_weights')):
+                    try:
+                        weights_str = ", ".join([f"{w:.3f}" for w in criterion.current_weights.cpu().numpy()])
+                        print_msg += f" | Weights: [{weights_str}]"
+                    except:
+                        print_msg += " | Weights: [updating...]"
+        
+        if epoch_val_mape < best_val_mape:
+            best_val_mape = epoch_val_mape
+            torch.save(model.state_dict(), model_path)
+            print_msg += " <<< BEST MAPE SO FAR - MODEL SAVED"
+        
+        print(print_msg)
+    
+    print(f"\nFinished {experiment_name}. Best Val MAPE: {best_val_mape:.4f}%")
+    return best_val_mape
+
 # =============================================================================
 # READY-TO-USE EXPERIMENTAL COMMANDS
 # =============================================================================
@@ -1155,1034 +1260,856 @@ def run_refined_phase2_experiments_integrated(num_epochs=30, min_velocity=1.5):
         return None
 
     # Setup data loaders
-    train_loader, val_loader = setup_phase2_data_loaders()
-    if train_loader is None or val_loader is None:
-        return None
-
-    print(f"\n🚀 Starting REFINED Phase 2 experiments with {num_epochs} epochs per experiment...")
-    print("🔧 All critical bugs fixed, systematic tuning implemented")
-    print("📊 This will systematically test 6 core experiments + weight tuning")
-    print("⏱️  Estimated time: ~{} minutes".format(num_epochs * 6 * len(train_loader) // 8))
-
-    # Run the refined experimental suite
-    results = run_refined_phase2_experiments(
-        BaselineUNet=BaselineUNet,
-        train_loader=train_loader,
-        val_loader=val_loader,
-        calculate_mape=calculate_mape,
-        device=device,
-        num_epochs=num_epochs,
-        min_velocity=min_velocity
+    train_loader, val_loader = setup_phase2_data_loaders(
+        test_size=0.2, 
+        batch_size=4,
+        num_workers=0,
+        random_state=42
     )
-
-    return results
-
-def test_systematic_weight_tuning_only(num_epochs=15, champion_mape=0.3790):
-    """Test only the systematic weight tuning around champion weights [1.0, 0.1, 0.005].
-
-    This is useful for focused tuning experiments without running the full suite.
-    """
-    print("🎯 Testing systematic weight tuning around champion weights...")
-
-    # Verify integration
-    if not integrate_phase2_with_existing_notebook():
-        return None
-
-    # Setup data loaders
-    train_loader, val_loader = setup_phase2_data_loaders()
+    
     if train_loader is None or val_loader is None:
+        print("❌ Failed to setup data loaders")
         return None
-
-    print(f"🔬 Running systematic weight tuning with {num_epochs} epochs per test...")
-    print(f"🏆 Target to beat: {champion_mape:.4f}% MAPE")
-
-    # Run systematic weight tuning
-    results = run_systematic_weight_tuning_experiments(
-        BaselineUNet=BaselineUNet,
-        train_loader=train_loader,
-        val_loader=val_loader,
-        calculate_mape=calculate_mape,
-        device=device,
-        num_epochs=num_epochs,
-        min_velocity=1.5,
-        champion_mape=champion_mape
-    )
-
-    return results
-
-def test_fixed_curriculum_only(num_epochs=25):
-    """Test only the fixed curriculum learning experiment to verify the bug fix."""
-    print("🧪 Testing fixed curriculum learning + SoftAdapt...")
-
-    # Verify integration
-    if not integrate_phase2_with_existing_notebook():
-        return None
-
-    # Setup data loaders
-    train_loader, val_loader = setup_phase2_data_loaders()
-    if train_loader is None or val_loader is None:
-        return None
-
-    print(f"🔬 Testing curriculum learning with {num_epochs} epochs...")
-    print("📚 First 10 epochs: LogMAE only, then full hybrid with SoftAdapt")
-
-    # Create model and optimizer
-    model = BaselineUNet(5, 1).to(device)
-    optimizer = optim.AdamW(model.parameters(), lr=1e-4, weight_decay=0.01)
-
-    # Create fixed curriculum loss with proper initialization
-    criterion = RefinedLogSpaceMAEHybridLoss(
-        min_velocity=1.5,
-        use_adaptive_softadapt=True,
-        logmae_momentum=0,  # Use fixed c=0.1
-        initial_c_logmae=0.1,
-        start_simple=True,
-        curriculum_epochs=10,
-        component_scales="adaptive",  # [15.0, 2.0, 50.0]
-        softadapt_beta=0.1,
-        softadapt_update_freq=5
-    ).to(device)
-
-    # Run training with fixed curriculum function
-    best_mape = train_with_curriculum_fixed(
-        "Test_FixedCurriculum", model, train_loader, val_loader,
-        criterion, optimizer, num_epochs, device, calculate_mape
-    )
-
-    print(f"✅ Fixed curriculum test completed! Best MAPE: {best_mape:.4f}%")
-    return {'FixedCurriculum': best_mape}
-
-def validate_champion_weights(num_epochs=20):
-    """Validate the current champion hybrid weights [1.0, 0.1, 0.005] with fresh training."""
-    print("🏆 Validating champion hybrid weights [1.0, 0.1, 0.005]...")
-
-    # Verify integration
-    if not integrate_phase2_with_existing_notebook():
-        return None
-
-    # Setup data loaders
-    train_loader, val_loader = setup_phase2_data_loaders()
-    if train_loader is None or val_loader is None:
-        return None
-
-    print(f"🔬 Validating champion with {num_epochs} epochs...")
-
-    # Create model and optimizer
-    model = BaselineUNet(5, 1).to(device)
-    optimizer = optim.AdamW(model.parameters(), lr=1e-4, weight_decay=0.01)
-
-    # Create champion hybrid loss
-    criterion = RefinedLogSpaceMAEHybridLoss(
-        min_velocity=1.5,
-        use_adaptive_softadapt=False,
-        logmae_momentum=0,  # Use fixed c=0.1 (best single component)
-        initial_c_logmae=0.1,
-        fixed_weights_list=[1.0, 0.1, 0.005]
-    ).to(device)
-
-    # Run training
-    best_mape, history = train_validate_model(
-        "Validate_Champion", model, train_loader, val_loader,
-        criterion, optimizer, num_epochs, device, calculate_mape
-    )
-
-    print(f"✅ Champion validation completed!")
-    print(f"🎯 Validation MAPE: {best_mape:.4f}%")
-
-    # Plot validation results
-    plot_history(history, "Champion Validation [1.0, 0.1, 0.005]")
-
-    return {'ChampionValidation': best_mape, 'history': history}
-
-def validate_champion_weights_a100_stable(num_epochs=20, disable_tf32=True):
-    """Validate champion hybrid weights [1.0, 0.1, 0.005] with A100 stability optimizations.
-
-    Addresses numerical precision issues when running the hybrid champion loss
-    on A100 GPUs compared to L4 or other architectures.
-    """
-    print("🔧 Validating champion hybrid weights with A100 stability optimizations...")
-
-    # Configure A100 stability FIRST
-    configure_a100_stability(disable_tf32=disable_tf32, verbose=True)
-
-    # Verify integration
-    if not integrate_phase2_with_existing_notebook():
-        return None
-
-    # Setup data loaders
-    train_loader, val_loader = setup_phase2_data_loaders()
-    if train_loader is None or val_loader is None:
-        return None
-
-    print(f"🔬 Validating champion with {num_epochs} epochs (A100 optimized)...")
-
-    # Create model and optimizer
-    model = BaselineUNet(5, 1).to(device)
-    optimizer = optim.AdamW(model.parameters(), lr=1e-4, weight_decay=0.01)
-
-    # Create A100-stabilized champion hybrid loss
-    criterion = RefinedLogSpaceMAEHybridLoss(
-        min_velocity=1.5,
-        use_adaptive_softadapt=False,
-        logmae_momentum=0,  # Use fixed c=0.1 (best single component)
-        initial_c_logmae=0.1,
-        fixed_weights_list=[1.0, 0.1, 0.005]
-    ).to(device)
-
-    # Replace SeismicMSSSIM with stabilized version
-    criterion.seismic_ms_ssim = StabilizedSeismicMSSSIM(
-        apply_log=True, data_range_log=2.0, c_for_log=0.1
-    ).to(device)
-
-    print("✓ Using StabilizedSeismicMSSSIM for A100 compatibility")
-
-    # Diagnostic check before training
-    print("\n🔍 Pre-training diagnostic check:")
-    diagnose_loss_components(model, criterion, val_loader, device, num_batches=3)
-
-    # Run training
-    best_mape, history = train_validate_model(
-        "A100_Stable_Champion", model, train_loader, val_loader,
-        criterion, optimizer, num_epochs, device, calculate_mape
-    )
-
-    print(f"\n✅ A100-stable champion validation completed!")
-    print(f"🎯 Validation MAPE: {best_mape:.4f}%")
-
-    # Post-training diagnostic
-    print("\n🔍 Post-training diagnostic check:")
-    diagnose_loss_components(model, criterion, val_loader, device, num_batches=3)
-
-    # Plot validation results
-    plot_history(history, "A100-Stable Champion [1.0, 0.1, 0.005]")
-
-    return {'A100_StableChampion': best_mape, 'history': history}
-
-def test_champion_weight_variants_a100(num_epochs=25):
-    """Test the champion weight variants with A100 stability to find the absolute best configuration.
-
-    Tests both [1.0, 0.1, 0.005] (original champion) and [1.0, 0.12, 0.007] (systematic tuning best)
-    with A100 optimizations to determine the true champion.
-    """
-    print("🏆 Testing champion weight variants with A100 stability...")
 
     # Configure A100 stability
-    configure_a100_stability(disable_tf32=True, verbose=True)
-
-    # Verify integration
-    if not integrate_phase2_with_existing_notebook():
-        return None
-
-    # Setup data loaders
-    train_loader, val_loader = setup_phase2_data_loaders()
-    if train_loader is None or val_loader is None:
-        return None
-
-    results = {}
-
-    # Test original champion weights [1.0, 0.1, 0.005]
-    print(f"\n[1/2] 🔬 Testing Original Champion [1.0, 0.1, 0.005]...")
-
-    model1 = BaselineUNet(5, 1).to(device)
-    optimizer1 = optim.AdamW(model1.parameters(), lr=1e-4, weight_decay=0.01)
-    criterion1 = RefinedLogSpaceMAEHybridLoss(
-        min_velocity=1.5, use_adaptive_softadapt=False, logmae_momentum=0,
-        initial_c_logmae=0.1, fixed_weights_list=[1.0, 0.1, 0.005]
+    if device.type == 'cuda':
+        configure_a100_stability(disable_tf32=True)
+        print("✅ A100 stability configured")
+    
+    # Create model
+    print("🔧 Initializing CompleteSincGAT_UNet...")
+    model = CompleteSincGAT_UNet(
+        sample_rate=10001,
+        num_receivers=31,
+        time_samples=10001,
+        num_shots=5,
+        sinc_out_channels=40,
+        sinc_kernel_size=251,
+        sinc_stride=50,
+        sinc_min_low_hz=80,
+        sinc_min_band_hz=10,
+        shot_embedding_dim=128,
+        gat_hidden_per_head=32,
+        gat_num_heads=4,
+        fused_embedding_dim=128,
+        n_unet_output_channels=1
     ).to(device)
-    criterion1.seismic_ms_ssim = StabilizedSeismicMSSSIM(apply_log=True, data_range_log=2.0, c_for_log=0.1).to(device)
-
-    best_mape1, _ = train_validate_model(
-        "A100_Champion_Original", model1, train_loader, val_loader,
-        criterion1, optimizer1, num_epochs, device, calculate_mape
+    
+    param_count = sum(p.numel() for p in model.parameters())
+    print(f"📊 Model parameters: {param_count:,}")
+    
+    # Get champion loss from prepare_architectural_experiments
+    print("🏆 Getting champion loss from prepare_architectural_experiments()...")
+    champion_loss_obj, champion_config = prepare_architectural_experiments()
+    criterion = champion_loss_obj.to(device)
+    
+    # Create optimizer
+    optimizer = optim.AdamW(
+        model.parameters(), 
+        lr=1e-4, 
+        weight_decay=0.01,
+        betas=(0.9, 0.999)
     )
-    results['Original_Champion_1.0_0.1_0.005'] = best_mape1
-    print(f"✓ Original Champion [1.0, 0.1, 0.005]: {best_mape1:.4f}% MAPE")
-
-    # Test systematic tuning best weights [1.0, 0.12, 0.007]
-    print(f"\n[2/2] 🔬 Testing Systematic Tuning Best [1.0, 0.12, 0.007]...")
-
-    model2 = BaselineUNet(5, 1).to(device)
-    optimizer2 = optim.AdamW(model2.parameters(), lr=1e-4, weight_decay=0.01)
-    criterion2 = RefinedLogSpaceMAEHybridLoss(
-        min_velocity=1.5, use_adaptive_softadapt=False, logmae_momentum=0,
-        initial_c_logmae=0.1, fixed_weights_list=[1.0, 0.12, 0.007]
-    ).to(device)
-    criterion2.seismic_ms_ssim = StabilizedSeismicMSSSIM(apply_log=True, data_range_log=2.0, c_for_log=0.1).to(device)
-
-    best_mape2, _ = train_validate_model(
-        "A100_Champion_Tuned", model2, train_loader, val_loader,
-        criterion2, optimizer2, num_epochs, device, calculate_mape
-    )
-    results['Tuned_Champion_1.0_0.12_0.007'] = best_mape2
-    print(f"✓ Tuned Champion [1.0, 0.12, 0.007]: {best_mape2:.4f}% MAPE")
-
-    # Determine absolute champion
-    absolute_champion = min(results.items(), key=lambda x: x[1])
-    champion_name, champion_mape = absolute_champion
-
-    print("\n" + "="*60)
-    print("🏆 A100-STABLE CHAMPION COMPARISON")
-    print("="*60)
-    print(f"Original Champion [1.0, 0.1, 0.005]: {results['Original_Champion_1.0_0.1_0.005']:.4f}% MAPE")
-    print(f"Tuned Champion [1.0, 0.12, 0.007]: {results['Tuned_Champion_1.0_0.12_0.007']:.4f}% MAPE")
-    print(f"\n👑 ABSOLUTE CHAMPION: {champion_name}")
-    print(f"🎯 CHAMPION MAPE: {champion_mape:.4f}%")
-
-    baseline_mape = 3.93
-    improvement = (baseline_mape - champion_mape) / baseline_mape * 100
-    print(f"📈 IMPROVEMENT vs BASELINE: {improvement:.1f}%")
-    print("="*60)
-
-    return results
-
-def diagnose_a100_issues_only():
-    """Quick diagnostic to check if A100 is causing issues with the hybrid loss."""
-    print("🔍 Quick A100 diagnostic for hybrid loss issues...")
-
-    # Configure A100 stability
-    configure_a100_stability(disable_tf32=True, verbose=True)
-
-    # Verify integration
-    if not integrate_phase2_with_existing_notebook():
-        return None
-
-    # Setup data loaders
-    train_loader, val_loader = setup_phase2_data_loaders()
-    if train_loader is None or val_loader is None:
-        return None
-
-    # Create model and hybrid loss
-    model = BaselineUNet(5, 1).to(device)
-    criterion = RefinedLogSpaceMAEHybridLoss(
-        min_velocity=1.5, use_adaptive_softadapt=False, logmae_momentum=0,
-        initial_c_logmae=0.1, fixed_weights_list=[1.0, 0.1, 0.005]
-    ).to(device)
-
-    print("🔬 Testing standard SeismicMSSSIM:")
-    stats_standard = diagnose_loss_components(model, criterion, val_loader, device, num_batches=3)
-
-    # Replace with stabilized version
-    criterion.seismic_ms_ssim = StabilizedSeismicMSSSIM(apply_log=True, data_range_log=2.0, c_for_log=0.1).to(device)
-
-    print("🔬 Testing StabilizedSeismicMSSSIM:")
-    stats_stabilized = diagnose_loss_components(model, criterion, val_loader, device, num_batches=3)
-
-    print("✅ A100 diagnostic complete!")
-    return {'standard': stats_standard, 'stabilized': stats_stabilized}
-
-# =============================================================================
-# ENHANCED READY-TO-USE EXPERIMENTAL COMMANDS
-# =============================================================================
-
-print("\n" + "="*60)
-print("REFINED PHASE 2 EXPERIMENTAL FRAMEWORK READY!")
-print("="*60)
-print("🔧 Critical bugs fixed:")
-print("   ✓ Curriculum learning AttributeError resolved")
-print("   ✓ SoftAdapt scaling improved based on component analysis")
-print("   ✓ Enhanced error handling and initialization")
-print("   ✓ A100 GPU stability optimizations added")
-print()
-print("Available commands:")
-print()
-print("🏆 1. Validate Current Champion (A100 Stable):")
-print("   results = validate_champion_weights_a100_stable(num_epochs=20)")
-print()
-print("🥇 2. Test Champion Weight Variants (A100 Optimized):")
-print("   results = test_champion_weight_variants_a100(num_epochs=25)")
-print()
-print("🔍 3. Quick A100 Diagnostic:")
-print("   results = diagnose_a100_issues_only()")
-print()
-print("🎯 4. Systematic Weight Tuning (A100 Compatible):")
-print("   configure_a100_stability()  # Run first")
-print("   results = test_systematic_weight_tuning_only(num_epochs=15)")
-print()
-print("🧪 5. Test Fixed Curriculum Learning:")
-print("   results = test_fixed_curriculum_only(num_epochs=25)")
-print()
-print("🚀 6. Complete Refined Phase 2 Suite:")
-print("   results = run_refined_phase2_experiments_integrated(num_epochs=30)")
-print()
-print("🔧 A100 GPU Optimizations Available:")
-print("   ✓ TF32 disable for FP32 precision")
-print("   ✓ StabilizedSeismicMSSSIM with enhanced numerical stability")
-print("   ✓ Loss component diagnostic tools")
-print("   ✓ Automatic precision handling for sensitive operations")
-print("="*60)
-
-# Example usage with refined experiments
-"""
-# REFINED USAGE EXAMPLE:
-
-# 1. Quick validation of current champion
-champion_results = validate_champion_weights()
-
-# 2. If validation successful, test systematic weight tuning
-tuning_results = test_systematic_weight_tuning_only(num_epochs=15, champion_mape=champion_results['ChampionValidation'])
-
-# 3. Test fixed curriculum learning (bug was critical)
-curriculum_results = test_fixed_curriculum_only()
-
-# 4. If individual tests pass, run complete refined suite
-full_results = run_refined_phase2_experiments_integrated(num_epochs=30)
-
-# 5. Analyze final results
-print("FINAL ANALYSIS:")
-print(f"Champion Validation: {champion_results['ChampionValidation']:.4f}% MAPE")
-best_tuning = min(tuning_results.values()) if tuning_results else float('inf')
-print(f"Best Tuning Result: {best_tuning:.4f}% MAPE")
-print(f"Curriculum Learning: {curriculum_results['FixedCurriculum']:.4f}% MAPE")
-"""
-
-def validate_absolute_champion_extended(num_epochs=45):
-    """Extended validation of the absolute champion configuration [1.0, 0.12, 0.007].
-
-    Confirms the 0.0997% MAPE breakthrough with longer training and
-    checks for potential further improvements.
-    """
-    print("👑 Extended validation of ABSOLUTE CHAMPION [1.0, 0.12, 0.007]...")
-    print(f"🎯 Target: Confirm/improve upon 0.0997% MAPE breakthrough")
-
-    # Configure A100 stability
-    configure_a100_stability(disable_tf32=True, verbose=True)
-
-    # Verify integration
-    if not integrate_phase2_with_existing_notebook():
-        return None
-
-    # Setup data loaders
-    train_loader, val_loader = setup_phase2_data_loaders()
-    if train_loader is None or val_loader is None:
-        return None
-
-    print(f"🔬 Extended training with {num_epochs} epochs...")
-
-    # Create model and optimizer
-    model = BaselineUNet(5, 1).to(device)
-    optimizer = optim.AdamW(model.parameters(), lr=1e-4, weight_decay=0.01)
-
-    # Create ABSOLUTE CHAMPION hybrid loss
-    criterion = RefinedLogSpaceMAEHybridLoss(
-        min_velocity=1.5,
-        use_adaptive_softadapt=False,
-        logmae_momentum=0,  # Use fixed c=0.1 (best single component)
-        initial_c_logmae=0.1,
-        fixed_weights_list=[1.0, 0.12, 0.007]  # CHAMPION WEIGHTS
-    ).to(device)
-
-    # Use StabilizedSeismicMSSSIM for A100 compatibility
-    criterion.seismic_ms_ssim = StabilizedSeismicMSSSIM(
-        apply_log=True, data_range_log=2.0, c_for_log=0.1
-    ).to(device)
-
-    print("✓ Using CHAMPION configuration: [1.0, 0.12, 0.007]")
-    print("✓ Using StabilizedSeismicMSSSIM for A100 stability")
-
-    # Pre-training diagnostic
-    print("\n🔍 Pre-training champion diagnostic:")
-    diagnose_loss_components(model, criterion, val_loader, device, num_batches=3)
-
-    # Run extended training with checkpointing every 10 epochs
-    best_mape, history = train_validate_model_with_checkpoints(
-        "Extended_Absolute_Champion", model, train_loader, val_loader,
-        criterion, optimizer, num_epochs, device, calculate_mape
-    )
-
-    print(f"\n🏆 EXTENDED CHAMPION VALIDATION COMPLETE!")
-    print(f"🎯 Final MAPE: {best_mape:.4f}%")
-
-    # Determine if we beat the 0.0997% target
-    target_mape = 0.0997
-    if best_mape < target_mape:
-        improvement = (target_mape - best_mape) / target_mape * 100
-        print(f"🎉 NEW RECORD! {improvement:.2f}% improvement over previous champion!")
-    elif best_mape <= target_mape * 1.05:  # Within 5%
-        print(f"✅ Confirmed champion performance (within 5% of target)")
-    else:
-        print(f"⚠️  Below target by {((best_mape - target_mape) / target_mape * 100):.1f}%")
-
-    # Post-training diagnostic
-    print("\n🔍 Post-training champion diagnostic:")
-    diagnose_loss_components(model, criterion, val_loader, device, num_batches=3)
-
-    # Enhanced results analysis
-    print("\n" + "="*60)
-    print("📈 CHAMPION PERFORMANCE ANALYSIS")
-    print("="*60)
-    baseline_mape = 3.93
-    improvement_vs_baseline = (baseline_mape - best_mape) / baseline_mape * 100
-    print(f"Baseline MAPE: {baseline_mape:.2f}%")
-    print(f"Champion MAPE: {best_mape:.4f}%")
-    print(f"Total Improvement: {improvement_vs_baseline:.1f}%")
-    print(f"Effective Reduction: {baseline_mape / best_mape:.1f}x better")
-    print("="*60)
-
-    # Plot detailed results
-    plot_history(history, f"ABSOLUTE CHAMPION [1.0, 0.12, 0.007] - {best_mape:.4f}% MAPE")
-
-    return {
-        'Extended_Champion_MAPE': best_mape,
-        'history': history,
-        'improvement_vs_baseline': improvement_vs_baseline,
-        'beats_target': best_mape < target_mape
-    }
-
-def train_validate_model_with_checkpoints(experiment_name, model, train_loader, val_loader, criterion,
-                                        optimizer, num_epochs, device, calculate_mape_func,
-                                        checkpoint_freq=10):
-    """Enhanced training with regular checkpointing for long experiments."""
-    print(f"\n--- Starting Extended Experiment: {experiment_name} ---")
-
-    best_val_mape = float('inf')
-    checkpoint_dir = "checkpoints"
-    if not os.path.exists(checkpoint_dir):
-        os.makedirs(checkpoint_dir)
-
-    final_model_path = os.path.join(checkpoint_dir, f"{experiment_name}_best_mape.pth")
-
-    history = {
-        'train_loss': [], 'val_mae': [], 'val_mape': [],
-        'val_logmae_loss': [], 'val_msssim_loss': [], 'val_atv_loss': [],
-        'loss_weights': []
-    }
-
+    
+    print(f"🚀 Starting DEBUG training with {num_epochs} epochs...")
+    print(f"   Detailed logging every {log_every_n_batches} batches")
+    
+    # Training loop with detailed debugging
+    model.train()
+    
     for epoch in range(num_epochs):
-        # Training Phase
-        model.train()
-        running_train_loss = 0.0
-
-        train_pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs} [Train]", leave=False)
-        for inputs, targets in train_pbar:
+        print(f"\n--- DEBUG EPOCH {epoch+1}/{num_epochs} ---")
+        
+        # Set epoch for curriculum learning if applicable
+        if hasattr(criterion, 'set_epoch'):
+            criterion.set_epoch(epoch)
+        
+        epoch_loss = 0.0
+        epoch_logmae = 0.0
+        epoch_msssim = 0.0 
+        epoch_atv = 0.0
+        
+        for batch_idx, (inputs, targets) in enumerate(tqdm(train_loader, desc=f"Epoch {epoch+1}")):
             inputs, targets = inputs.to(device), targets.to(device)
+            
+            optimizer.zero_grad()
+            outputs = model(inputs)
+            
+            # Get detailed loss breakdown
+            loss_dict = criterion(outputs, targets)
+            total_loss = loss_dict['total']
+            
+            # Detailed logging every N batches
+            if batch_idx % log_every_n_batches == 0:
+                logmae_val = loss_dict['logmae'].item()
+                msssim_val = loss_dict['msssim'].item()
+                atv_val = loss_dict['atv'].item()
+                total_val = total_loss.item()
+                weights = loss_dict['weights']
+                
+                print(f"  Batch {batch_idx}:")
+                print(f"    Total Loss: {total_val:.6f}")
+                print(f"    LogMAE: {logmae_val:.6f}")
+                print(f"    MS-SSIM: {msssim_val:.6f}")
+                print(f"    ATV: {atv_val:.6f}")
+                print(f"    Weights: [{weights[0]:.3f}, {weights[1]:.3f}, {weights[2]:.3f}]")
+                print(f"    Ratios - MSSSIM/LogMAE: {msssim_val/(logmae_val+1e-8):.2f}, ATV/LogMAE: {atv_val/(logmae_val+1e-8):.2f}")
+                
+                # Check for numerical issues
+                if np.isnan(total_val) or np.isnan(logmae_val) or np.isnan(msssim_val) or np.isnan(atv_val):
+                    print("    ⚠️  NaN detected in loss components!")
+                if np.isinf(total_val) or np.isinf(logmae_val) or np.isinf(msssim_val) or np.isinf(atv_val):
+                    print("    ⚠️  Inf detected in loss components!")
+                
+                # Output statistics
+                output_mean = outputs.mean().item()
+                output_std = outputs.std().item()
+                output_min = outputs.min().item()
+                output_max = outputs.max().item()
+                target_mean = targets.mean().item()
+                target_std = targets.std().item()
+                
+                print(f"    Output stats: mean={output_mean:.4f}, std={output_std:.4f}, min={output_min:.4f}, max={output_max:.4f}")
+                print(f"    Target stats: mean={target_mean:.4f}, std={target_std:.4f}")
+            
+            # Backward pass
+            total_loss.backward()
+            
+            # Gradient inspection for first few batches of first epoch
+            if epoch == 0 and batch_idx < 3:
+                print(f"  Gradient Analysis - Batch {batch_idx}:")
+                grad_stats = {}
+                
+                for name, param in model.named_parameters():
+                    if param.grad is not None:
+                        grad_mean = param.grad.mean().item()
+                        grad_std = param.grad.std().item()
+                        grad_max_abs = param.grad.abs().max().item()
+                        grad_stats[name] = {
+                            'mean': grad_mean,
+                            'std': grad_std, 
+                            'max_abs': grad_max_abs
+                        }
+                        
+                        # Only print concerning gradients
+                        if grad_max_abs > 10.0 or grad_max_abs < 1e-8 or np.isnan(grad_mean):
+                            print(f"    ⚠️  {name}: mean={grad_mean:.2e}, std={grad_std:.2e}, max_abs={grad_max_abs:.2e}")
+                    else:
+                        print(f"    ❌ {name}: No gradient")
+                
+                # Summary of gradient magnitudes by component
+                sincnet_grads = [v['max_abs'] for k, v in grad_stats.items() if 'temporal_encoders' in k]
+                gat_grads = [v['max_abs'] for k, v in grad_stats.items() if 'gat_fusion' in k]
+                unet_grads = [v['max_abs'] for k, v in grad_stats.items() if 'baseline_unet' in k]
+                
+                if sincnet_grads:
+                    print(f"    SincNet grad range: {min(sincnet_grads):.2e} to {max(sincnet_grads):.2e}")
+                if gat_grads:
+                    print(f"    GAT grad range: {min(gat_grads):.2e} to {max(gat_grads):.2e}")
+                if unet_grads:
+                    print(f"    U-Net grad range: {min(unet_grads):.2e} to {max(unet_grads):.2e}")
+            
+            # Gradient clipping (optional - uncomment if needed)
+            # torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            
+            optimizer.step()
+            
+            # Accumulate epoch statistics
+            epoch_loss += total_loss.item()
+            epoch_logmae += loss_dict['logmae'].item()
+            epoch_msssim += loss_dict['msssim'].item()
+            epoch_atv += loss_dict['atv'].item()
+        
+        # Epoch summary
+        num_batches = len(train_loader)
+        avg_loss = epoch_loss / num_batches
+        avg_logmae = epoch_logmae / num_batches
+        avg_msssim = epoch_msssim / num_batches
+        avg_atv = epoch_atv / num_batches
+        
+        print(f"\n📊 EPOCH {epoch+1} SUMMARY:")
+        print(f"   Avg Total Loss: {avg_loss:.6f}")
+        print(f"   Avg LogMAE: {avg_logmae:.6f}")
+        print(f"   Avg MS-SSIM: {avg_msssim:.6f}")
+        print(f"   Avg ATV: {avg_atv:.6f}")
+        
+        # Validation 
+        model.eval()
+        val_mae_total = 0.0
+        val_mape_total = 0.0
+        
+        with torch.no_grad():
+            for inputs, targets in val_loader:
+                inputs, targets = inputs.to(device), targets.to(device)
+                outputs = model(inputs)
+                
+                # Calculate validation metrics
+                mae = torch.mean(torch.abs(outputs - targets)).item()
+                val_mae_total += mae
+                
+                for i in range(outputs.shape[0]):
+                    pred_np = outputs[i].squeeze().cpu().numpy()
+                    target_np = targets[i].squeeze().cpu().numpy()
+                    mape = calculate_mape(target_np, pred_np)
+                    val_mape_total += mape
+        
+        avg_val_mae = val_mae_total / len(val_loader)
+        avg_val_mape = val_mape_total / (len(val_loader) * val_loader.batch_size)
+        
+        print(f"   Val MAE: {avg_val_mae:.6f}")
+        print(f"   Val MAPE: {avg_val_mape:.4f}%")
+        
+        model.train()
+        
+        # Early termination if loss is clearly stuck
+        if epoch > 0 and abs(avg_loss - prev_loss) < 1e-6:
+            print(f"⚠️  Loss stagnation detected at epoch {epoch+1}. Terminating early.")
+            break
+        prev_loss = avg_loss
+    
+    print("="*80)
+    print("🔍 DEBUG ANALYSIS COMPLETE")
+    print("="*80)
+    
+    return {
+        'final_loss': avg_loss,
+        'final_mape': avg_val_mape,
+        'final_mae': avg_val_mae
+    }
+
+def debug_sincgat_with_curriculum(num_epochs=20, curriculum_epochs=10):
+    """
+    Test SincGAT-UNet with curriculum learning for the hybrid loss.
+    Start with LogMAE only, then gradually introduce other components.
+    """
+    print("="*80)
+    print("🎓 DEBUG: SINCGAT-UNET + CURRICULUM HYBRID LOSS")
+    print("="*80)
+    
+    # Import required modules
+    try:
+        import torch_geometric
+        from complete_sincgat_unet_integration import CompleteSincGAT_UNet, configure_a100_stability
+        print("✅ Successfully imported SincGAT-UNet modules")
+    except ImportError as e:
+        print(f"❌ Failed to import required modules: {e}")
+        return None
+
+    # Setup data loaders
+    train_loader, val_loader = setup_phase2_data_loaders(
+        test_size=0.2, 
+        batch_size=4,
+        num_workers=0,
+        random_state=42
+    )
+    
+    if train_loader is None or val_loader is None:
+        print("❌ Failed to setup data loaders")
+        return None
+
+    # Configure A100 stability
+    if device.type == 'cuda':
+        configure_a100_stability(disable_tf32=True)
+        print("✅ A100 stability configured")
+    
+    # Create model
+    print("🔧 Initializing CompleteSincGAT_UNet...")
+    model = CompleteSincGAT_UNet(
+        sample_rate=10001,
+        num_receivers=31,
+        time_samples=10001,
+        num_shots=5,
+        sinc_out_channels=40,
+        sinc_kernel_size=251,
+        sinc_stride=50,
+        sinc_min_low_hz=80,
+        sinc_min_band_hz=10,
+        shot_embedding_dim=128,
+        gat_hidden_per_head=32,
+        gat_num_heads=4,
+        fused_embedding_dim=128,
+        n_unet_output_channels=1
+    ).to(device)
+    
+    # Create curriculum hybrid loss
+    print(f"🎓 Setting up curriculum hybrid loss (LogMAE only for {curriculum_epochs} epochs)...")
+    criterion = RefinedLogSpaceMAEHybridLoss(
+        min_velocity=1.5,
+        use_adaptive_softadapt=False,
+        logmae_momentum=0,
+        initial_c_logmae=0.1,
+        fixed_weights_list=[1.0, 0.12, 0.007],  # Target weights after curriculum
+        start_simple=True,  # Start with LogMAE only
+        curriculum_epochs=curriculum_epochs,
+        ms_ssim_apply_log=True,
+        ms_ssim_data_range_log=2.0,
+        ms_ssim_c_log=0.1,
+        atv_weight_h=1.0,
+        atv_weight_v=0.3
+    ).to(device)
+    
+    # Create optimizer
+    optimizer = optim.AdamW(
+        model.parameters(), 
+        lr=1e-4, 
+        weight_decay=0.01,
+        betas=(0.9, 0.999)
+    )
+    
+    print(f"🚀 Starting curriculum training with {num_epochs} epochs...")
+    print(f"   Epochs 1-{curriculum_epochs}: LogMAE only")
+    print(f"   Epochs {curriculum_epochs+1}-{num_epochs}: Full hybrid loss [1.0, 0.12, 0.007]")
+    
+    # Use the existing training function with curriculum support
+    results = train_with_curriculum_fixed(
+        experiment_name="SincGAT_UNet_Curriculum_Debug",
+        model=model,
+        train_loader=train_loader,
+        val_loader=val_loader,
+        criterion=criterion,
+        optimizer=optimizer,
+        num_epochs=num_epochs,
+        device=device,
+        calculate_mape_func=calculate_mape
+    )
+    
+    print("="*80)
+    print("🎓 CURRICULUM DEBUG COMPLETE")
+    # Fix: Handle scalar return value properly
+    if isinstance(results, (list, tuple)) and len(results) > 0:
+        print(f"🏆 Best Validation MAPE: {results[0]:.4f}%")
+    else:
+        print(f"🏆 Training completed successfully")
+    print("="*80)
+
+    return results
+
+def test_sincgat_single_batch_overfit():
+    """
+    Test if SincGAT-UNet + Champion Hybrid Loss can overfit a single batch.
+    This isolates gradient/optimization issues from generalization issues.
+    """
+    print("="*80)
+    print("🎯 DEBUG: SINGLE BATCH OVERFITTING TEST")
+    print("="*80)
+    
+    # Import required modules
+    try:
+        import torch_geometric
+        from complete_sincgat_unet_integration import CompleteSincGAT_UNet, configure_a100_stability
+        print("✅ Successfully imported SincGAT-UNet modules")
+    except ImportError as e:
+        print(f"❌ Failed to import required modules: {e}")
+        return None
+    
+    # Setup data loaders (we'll only use one batch)
+    train_loader, val_loader = setup_phase2_data_loaders(
+        test_size=0.2, 
+        batch_size=4,
+        num_workers=0,
+        random_state=42
+    )
+    
+    if train_loader is None:
+        print("❌ Failed to setup data loaders")
+        return None
+
+    # Get single batch
+    single_batch = next(iter(train_loader))
+    inputs, targets = single_batch[0].to(device), single_batch[1].to(device)
+    print(f"📦 Using single batch: {inputs.shape} -> {targets.shape}")
+    
+    # Configure A100 stability
+    if device.type == 'cuda':
+        configure_a100_stability(disable_tf32=True)
+        print("✅ A100 stability configured")
+    
+    # Create model
+    print("🔧 Initializing CompleteSincGAT_UNet...")
+    model = CompleteSincGAT_UNet(
+        sample_rate=10001,
+        num_receivers=31,
+        time_samples=10001,
+        num_shots=5,
+        sinc_out_channels=40,
+        sinc_kernel_size=251,
+        sinc_stride=50,
+        sinc_min_low_hz=80,
+        sinc_min_band_hz=10,
+        shot_embedding_dim=128,
+        gat_hidden_per_head=32,
+        gat_num_heads=4,
+        fused_embedding_dim=128,
+        n_unet_output_channels=1
+    ).to(device)
+
+    # Get champion loss
+    print("🏆 Getting champion loss...")
+    champion_loss_obj, _ = prepare_architectural_experiments()
+    criterion = champion_loss_obj.to(device)
+    
+    # Create optimizer
+    optimizer = optim.AdamW(
+        model.parameters(), 
+        lr=1e-4, 
+        weight_decay=0.01,
+        betas=(0.9, 0.999)
+    )
+    
+    print("🚀 Starting single batch overfitting test (100 iterations)...")
+    
+        model.train()
+    losses = []
+
+    for iteration in range(100):
             optimizer.zero_grad()
             outputs = model(inputs)
 
-            if isinstance(criterion, RefinedLogSpaceMAEHybridLoss):
                 loss_dict = criterion(outputs, targets)
-                loss = loss_dict['total']
-            else:
-                loss = criterion(outputs, targets)
-
-            loss.backward()
-            optimizer.step()
-            running_train_loss += loss.item() * inputs.size(0)
-            train_pbar.set_postfix({'loss': loss.item()})
-
-        epoch_train_loss = running_train_loss / len(train_loader.dataset)
-        history['train_loss'].append(epoch_train_loss)
-
-        # Validation Phase
-        model.eval()
-        running_val_mae_orig_scale = 0.0
-        running_val_mape = 0.0
-        running_val_logmae_component = 0.0
-        running_val_msssim_component = 0.0
-        running_val_atv_component = 0.0
-
-        val_pbar = tqdm(val_loader, desc=f"Epoch {epoch+1}/{num_epochs} [Val]", leave=False)
-        with torch.no_grad():
-            for inputs, targets in val_pbar:
-                inputs, targets_torch = inputs.to(device), targets.to(device)
-                outputs_torch = model(inputs)
-
-                # Calculate MAE on original scale
-                mae_orig = F.l1_loss(outputs_torch, targets_torch)
-                running_val_mae_orig_scale += mae_orig.item() * inputs.size(0)
-
-                # Calculate components if hybrid loss
-                if isinstance(criterion, RefinedLogSpaceMAEHybridLoss):
-                    val_loss_dict = criterion(outputs_torch, targets_torch)
-                    running_val_logmae_component += val_loss_dict['logmae'].item() * inputs.size(0)
-                    running_val_msssim_component += val_loss_dict['msssim'].item() * inputs.size(0)
-                    running_val_atv_component += val_loss_dict['atv'].item() * inputs.size(0)
-
-                # Calculate MAPE
-                outputs_np = outputs_torch.squeeze(1).cpu().numpy()
-                targets_np = targets_torch.squeeze(1).cpu().numpy()
-                batch_mape_sum = 0.0
-                for i in range(outputs_np.shape[0]):
-                    batch_mape_sum += calculate_mape_func(targets_np[i], outputs_np[i])
-                running_val_mape += (batch_mape_sum / outputs_np.shape[0]) * inputs.size(0)
-
-        epoch_val_mae_orig = running_val_mae_orig_scale / len(val_loader.dataset)
-        epoch_val_mape = running_val_mape / len(val_loader.dataset)
-        history['val_mae'].append(epoch_val_mae_orig)
-        history['val_mape'].append(epoch_val_mape)
-
-        if isinstance(criterion, RefinedLogSpaceMAEHybridLoss):
-            history['val_logmae_loss'].append(running_val_logmae_component / len(val_loader.dataset))
-            history['val_msssim_loss'].append(running_val_msssim_component / len(val_loader.dataset))
-            history['val_atv_loss'].append(running_val_atv_component / len(val_loader.dataset))
-
-        print_msg = (f"Epoch {epoch+1}/{num_epochs} | Train Loss: {epoch_train_loss:.6f} | "
-                     f"Val MAE (Orig): {epoch_val_mae_orig:.6f} | Val MAPE: {epoch_val_mape:.4f}%")
-
-        if epoch_val_mape < best_val_mape:
-            best_val_mape = epoch_val_mape
-            torch.save(model.state_dict(), final_model_path)
-            print_msg += " <<< NEW BEST MAPE - MODEL SAVED"
-
-        # Checkpoint every N epochs
-        if (epoch + 1) % checkpoint_freq == 0:
-            checkpoint_path = os.path.join(checkpoint_dir, f"{experiment_name}_epoch_{epoch+1}.pth")
-            torch.save({
-                'epoch': epoch + 1,
-                'model_state_dict': model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'best_mape': best_val_mape,
-                'history': history
-            }, checkpoint_path)
-            print_msg += f" | Checkpoint saved"
-
-        print(print_msg)
-
-    print(f"\nExtended training complete! Best Val MAPE: {best_val_mape:.4f}%")
-    return best_val_mape, history
-
-def document_champion_configuration():
-    """Document the CHAMPION configuration that achieved 0.0862% MAPE for future reference."""
-
-    champion_config = {
-        "performance": {
-            "validation_mape": 0.0862,
-            "improvement_vs_baseline": 97.8,  # % improvement over 3.93% baseline
-            "improvement_vs_previous": 46.4,  # % improvement over 0.1609% previous best
-            "original_mae": 0.17,  # Approximate final original scale MAE
-            "epochs_to_convergence": 41
-        },
-        "architecture": {
-            "model_class": "BaselineUNet",
-            "input_channels": 5,
-            "output_channels": 1,
-            "parameters": "~1.9M"  # Approximate
-        },
-        "loss_function": {
-            "type": "RefinedLogSpaceMAEHybridLoss",
-            "components": {
-                "logmae": {"weight": 1.0, "fixed_c": 0.1, "momentum": 0},
-                "ms_ssim": {"weight": 0.12, "apply_log": True, "data_range": 2.0},
-                "atv": {"weight": 0.007, "weight_h": 1.0, "weight_v": 0.3}
-            },
-            "stabilized_msssim": True,
-            "adaptive_weighting": False
-        },
-        "training_config": {
-            "optimizer": "AdamW",
-            "learning_rate": 1e-4,
-            "weight_decay": 0.01,
-            "batch_size": 8,
-            "epochs": 45,
-            "hardware": "A100",
-            "tf32_disabled": True,
-            "num_workers": 0
-        },
-        "final_loss_components": {
-            "logmae_mean": 0.039319,
-            "msssim_mean": 0.254417,
-            "atv_mean": 0.004205,
-            "total_mean": 0.069878
-        },
-        "checkpoint_path": "checkpoints/Extended_Absolute_Champion_best_mape.pth",
-        "validation_date": "2024-current",
-        "notes": "World-class performance achieved through systematic loss engineering and A100 optimization"
+        total_loss = loss_dict['total']
+        
+        total_loss.backward()
+        
+        # Check gradients occasionally
+        if iteration % 20 == 0:
+            grad_norm = 0.0
+            for param in model.parameters():
+                if param.grad is not None:
+                    grad_norm += param.grad.data.norm(2).item() ** 2
+            grad_norm = grad_norm ** 0.5
+            
+            print(f"  Iter {iteration}: Loss={total_loss.item():.6f}, GradNorm={grad_norm:.4f}")
+            print(f"    LogMAE={loss_dict['logmae'].item():.6f}, MS-SSIM={loss_dict['msssim'].item():.6f}, ATV={loss_dict['atv'].item():.6f}")
+        
+        optimizer.step()
+        losses.append(total_loss.item())
+        
+        # Early success check
+        if total_loss.item() < 0.1:
+            print(f"✅ Successfully reduced loss to {total_loss.item():.6f} at iteration {iteration}")
+            break
+    
+    print(f"📊 Final loss: {losses[-1]:.6f}")
+    print(f"📊 Loss reduction: {losses[0]:.6f} -> {losses[-1]:.6f} ({((losses[0]-losses[-1])/losses[0]*100):.1f}% reduction)")
+    
+    if losses[-1] < losses[0] * 0.5:
+        print("✅ Model CAN learn on single batch - issue may be with full dataset optimization")
+    else:
+        print("⚠️  Model struggling even on single batch - fundamental gradient/loss issue")
+    
+    return {
+        'initial_loss': losses[0],
+        'final_loss': losses[-1],
+        'loss_history': losses
     }
 
-    print("=" * 80)
-    print("🏆 CHAMPION CONFIGURATION DOCUMENTATION")
-    print("=" * 80)
-    print(f"🎯 VALIDATION MAPE: {champion_config['performance']['validation_mape']:.4f}%")
-    print(f"📈 IMPROVEMENT vs BASELINE: {champion_config['performance']['improvement_vs_baseline']:.1f}%")
-    print(f"🚀 IMPROVEMENT vs PREVIOUS: {champion_config['performance']['improvement_vs_previous']:.1f}%")
-    print()
-    print("🔧 LOSS CONFIGURATION:")
-    print(f"   LogMAE (Fixed c=0.1): weight = {champion_config['loss_function']['components']['logmae']['weight']}")
-    print(f"   MS-SSIM (Log-space): weight = {champion_config['loss_function']['components']['ms_ssim']['weight']}")
-    print(f"   AnisotropicTV: weight = {champion_config['loss_function']['components']['atv']['weight']}")
-    print()
-    print("⚙️  TRAINING CONFIGURATION:")
-    print(f"   Batch Size: {champion_config['training_config']['batch_size']}")
-    print(f"   Hardware: {champion_config['training_config']['hardware']} (TF32 disabled)")
-    print(f"   Optimizer: {champion_config['training_config']['optimizer']} (lr={champion_config['training_config']['learning_rate']}, wd={champion_config['training_config']['weight_decay']})")
-    print()
-    print("📊 FINAL COMPONENT BALANCE:")
-    print(f"   LogMAE: {champion_config['final_loss_components']['logmae_mean']:.6f}")
-    print(f"   MS-SSIM: {champion_config['final_loss_components']['msssim_mean']:.6f}")
-    print(f"   ATV: {champion_config['final_loss_components']['atv_mean']:.6f}")
-    print("=" * 80)
+# Add usage instructions
+print("🔧 SincGAT-UNet debugging functions added:")
+print("   debug_sincgat_loss_components(5, 10)     # Detailed loss component analysis")
+print("   debug_sincgat_with_curriculum(20, 10)    # Test curriculum learning")
+print("   test_sincgat_single_batch_overfit()      # Single batch overfitting test")
 
-    return champion_config
+# Add comprehensive curriculum training function after the debug functions
 
-def create_champion_model():
-    """Create the exact champion model configuration for architectural experiments."""
-
-    print("🏆 Creating CHAMPION model configuration...")
-
-    # Create champion hybrid loss
-    champion_loss = RefinedLogSpaceMAEHybridLoss(
-        min_velocity=1.5,
-        use_adaptive_softadapt=False,
-        logmae_momentum=0,  # Fixed c=0.1
-        initial_c_logmae=0.1,
-        fixed_weights_list=[1.0, 0.12, 0.007]  # CHAMPION WEIGHTS
-    )
-
-    # Use StabilizedSeismicMSSSIM for A100 compatibility
-    champion_loss.seismic_ms_ssim = StabilizedSeismicMSSSIM(
-        apply_log=True,
-        data_range_log=2.0,
-        c_for_log=0.1
-    )
-
-    print("✓ Champion loss function created")
-    print("✓ Configuration: [1.0, 0.12, 0.007] with StabilizedSeismicMSSSIM")
-
-    return champion_loss
-
-def validate_champion_visual_outputs(num_samples=5):
-    """Generate visual validation of champion model outputs for qualitative assessment."""
-
-    print("🔍 Generating visual validation of CHAMPION outputs...")
-
-    # Configure A100 stability
-    configure_a100_stability(disable_tf32=True, verbose=False)
-
-    # Verify integration
-    if not integrate_phase2_with_existing_notebook():
-        return None
-
-    # Setup data loaders
-    train_loader, val_loader = setup_phase2_data_loaders()
-    if train_loader is None or val_loader is None:
-        return None
-
-    # Load champion model
-    model = BaselineUNet(5, 1).to(device)
-    champion_path = "checkpoints/Extended_Absolute_Champion_best_mape.pth"
-
+def run_sincgat_full_curriculum_training(num_epochs=50, curriculum_epochs=10, batch_size=4):
+    """
+    Run full curriculum training based on successful debug results.
+    This is the RECOMMENDED approach for training CompleteSincGAT_UNet.
+    
+    Args:
+        num_epochs: Total training epochs (40-50 recommended)
+        curriculum_epochs: Epochs for LogMAE-only phase (10 is proven effective)
+        batch_size: Batch size (4 is proven stable for this architecture)
+    """
+    print("="*80)
+    print("🎓 FULL CURRICULUM TRAINING - SINCGAT-UNET")
+    print("="*80)
+    print(f"📋 TRAINING PLAN:")
+    print(f"   Epochs 1-{curriculum_epochs}: LogMAE only (foundation learning)")
+    print(f"   Epochs {curriculum_epochs+1}-{num_epochs}: Full hybrid loss [1.0, 0.12, 0.007]")
+    print(f"   Batch size: {batch_size} (proven stable)")
+    print(f"   Target: Beat champion 0.0862% MAPE")
+    print("="*80)
+    
+    # Import required modules
     try:
-        model.load_state_dict(torch.load(champion_path))
-        print(f"✓ Loaded champion model from {champion_path}")
-    except FileNotFoundError:
-        print(f"⚠️  Champion model not found at {champion_path}")
-        print("   Please run the extended validation first")
+        import torch_geometric
+        from complete_sincgat_unet_integration import CompleteSincGAT_UNet, configure_a100_stability
+        print("✅ Successfully imported SincGAT-UNet modules")
+    except ImportError as e:
+        print(f"❌ Failed to import required modules: {e}")
+        return None
+    
+    # Setup data loaders with proven stable batch size
+    train_loader, val_loader = setup_phase2_data_loaders(
+        test_size=0.2, 
+        batch_size=batch_size,
+        num_workers=0,
+        random_state=42
+    )
+    
+    if train_loader is None or val_loader is None:
+        print("❌ Failed to setup data loaders")
+        return None
+    
+    # Configure A100 stability (proven critical)
+    if device.type == 'cuda':
+        configure_a100_stability(disable_tf32=True)
+        print("✅ A100 stability configured")
+    
+    # Create CompleteSincGAT_UNet with proven parameters
+    print("🔧 Initializing CompleteSincGAT_UNet...")
+    model = CompleteSincGAT_UNet(
+        sample_rate=10001,          # Critical: 10001 Hz for 1-second seismic data
+        num_receivers=31,
+        time_samples=10001,
+        num_shots=5,
+        sinc_out_channels=40,       # Proven effective
+        sinc_kernel_size=251,
+        sinc_stride=50,
+        sinc_min_low_hz=80,         # Geophysically relevant minimum
+        sinc_min_band_hz=10,        # Bandwidth parameter
+        shot_embedding_dim=128,     # Balanced compression
+        gat_hidden_per_head=32,     # Effective attention dimension
+        gat_num_heads=4,            # Multi-head attention
+        fused_embedding_dim=128,    # Consistent with shot embeddings
+        n_unet_output_channels=1    # Single velocity output
+    ).to(device)
+    
+    param_count = sum(p.numel() for p in model.parameters())
+    print(f"📊 Model parameters: {param_count:,}")
+    print(f"   Breakdown: ~442K SincNet + ~58K GAT + ~17.3M U-Net + ~460K Integration")
+    
+    # Create curriculum hybrid loss with champion configuration
+    print("🏆 Setting up champion curriculum hybrid loss...")
+    criterion = RefinedLogSpaceMAEHybridLoss(
+        min_velocity=1.5,                        # Champion parameter
+        use_adaptive_softadapt=False,            # Use fixed weights
+        logmae_momentum=0,                       # FixedCLogSpaceMAE behavior
+        initial_c_logmae=0.1,                    # Champion c value
+        fixed_weights_list=[1.0, 0.12, 0.007],  # Champion weights [LogMAE, MS-SSIM, ATV]
+        start_simple=True,                       # CURRICULUM: Start with LogMAE only
+        curriculum_epochs=curriculum_epochs,     # Proven effective at 10
+        # Champion MS-SSIM parameters
+        ms_ssim_apply_log=True,
+        ms_ssim_data_range_log=2.0,
+        ms_ssim_c_log=0.1,
+        # Champion ATV parameters  
+        atv_weight_h=1.0,
+        atv_weight_v=0.3
+    ).to(device)
+    
+    print(f"✅ Curriculum loss configured:")
+    print(f"   Phase 1 (Epochs 1-{curriculum_epochs}): LogMAE only")
+    print(f"   Phase 2 (Epochs {curriculum_epochs+1}+): Champion weights [1.0, 0.12, 0.007]")
+    
+    # Create optimizer with champion settings
+    optimizer = optim.AdamW(
+        model.parameters(), 
+        lr=1e-4,                    # Champion learning rate
+        weight_decay=0.01,          # Champion weight decay
+        betas=(0.9, 0.999)          # Champion beta values
+    )
+    
+    print("🚀 Starting full curriculum training...")
+    print(f"   Architecture: CompleteSincGAT_UNet ({param_count:,} params)")
+    print(f"   Loss: Champion RefinedLogSpaceMAEHybridLoss + Curriculum")
+    print(f"   Optimizer: AdamW (lr=1e-4, wd=0.01)")
+    print(f"   Scheduler: None (matching champion)")
+    print(f"   Device: {device}")
+    
+    # Execute training with curriculum support and checkpointing
+    # CRITICAL FIX: Use train_with_curriculum_fixed instead of train_validate_model_with_checkpoints
+    results = train_with_curriculum_fixed(
+        experiment_name="SincGAT_UNet_Full_Curriculum",
+        model=model,
+        train_loader=train_loader,
+        val_loader=val_loader, 
+        criterion=criterion,
+        optimizer=optimizer,
+        num_epochs=num_epochs,
+        device=device,
+        calculate_mape_func=calculate_mape
+    )
+    
+    print("="*80)
+    print("🎓 FULL CURRICULUM TRAINING COMPLETE")
+    if isinstance(results, (list, tuple)) and len(results) > 0:
+        best_mape = results[0]
+        print(f"🏆 Best Validation MAPE: {best_mape:.4f}%")
+        
+        # Performance comparison
+        champion_mape = 0.0862
+        if best_mape < champion_mape:
+            improvement = champion_mape / best_mape
+            print(f"🎉 NEW RECORD! {improvement:.2f}x better than champion ({champion_mape:.4f}%)")
+        else:
+            ratio = best_mape / champion_mape
+            print(f"📊 Performance: {ratio:.2f}x champion baseline ({champion_mape:.4f}%)")
+    else:
+        print("🏆 Training completed successfully")
+    
+    print("="*80)
+    
+    return results
+
+def analyze_sincgat_learned_filters():
+    """
+    Analyze learned SincNet filters after training.
+    This provides insights into what frequency patterns the model learned.
+    """
+    print("="*80)
+    print("🔍 ANALYZING LEARNED SINCNET FILTERS")
+    print("="*80)
+    
+    try:
+        import torch_geometric
+        from complete_sincgat_unet_integration import CompleteSincGAT_UNet
+        print("✅ Successfully imported SincGAT-UNet modules")
+    except ImportError as e:
+        print(f"❌ Failed to import required modules: {e}")
         return None
 
+    # Try to load the best trained model
+    model_path = "checkpoints/SincGAT_UNet_Full_Curriculum_best_mape.pth"
+    
+    if not os.path.exists(model_path):
+        print(f"⚠️  Model checkpoint not found: {model_path}")
+        print("   Please run full curriculum training first")
+        return None
+
+    # Create model and load weights
+    model = CompleteSincGAT_UNet(
+        sample_rate=10001,
+        num_receivers=31,
+        time_samples=10001,
+        num_shots=5,
+        sinc_out_channels=40,
+        sinc_kernel_size=251,
+        sinc_stride=50,
+        sinc_min_low_hz=80,
+        sinc_min_band_hz=10,
+        shot_embedding_dim=128,
+        gat_hidden_per_head=32,
+        gat_num_heads=4,
+        fused_embedding_dim=128,
+        n_unet_output_channels=1
+    ).to(device)
+    
+    model.load_state_dict(torch.load(model_path))
     model.eval()
 
-    # Generate predictions on validation samples
-    predictions = []
-    targets = []
-
-    with torch.no_grad():
-        for i, (inputs, target_batch) in enumerate(val_loader):
-            if i >= num_samples:
-                break
-
-            inputs, target_batch = inputs.to(device), target_batch.to(device)
-            pred_batch = model(inputs)
-
-            # Convert to numpy for visualization
-            pred_np = pred_batch.squeeze(1).cpu().numpy()
-            target_np = target_batch.squeeze(1).cpu().numpy()
-
-            predictions.extend(pred_np)
-            targets.extend(target_np)
-
-    # Calculate detailed metrics
-    mapes = []
-    maes = []
-
-    for pred, target in zip(predictions, targets):
-        sample_mape = calculate_mape(target, pred)
-        sample_mae = np.mean(np.abs(pred - target))
-        mapes.append(sample_mape)
-        maes.append(sample_mae)
-
-    print(f"\n📊 CHAMPION VISUAL VALIDATION RESULTS:")
-    print(f"Samples analyzed: {len(predictions)}")
-    print(f"Average MAPE: {np.mean(mapes):.4f}% (±{np.std(mapes):.4f}%)")
-    print(f"Average MAE: {np.mean(maes):.6f} (±{np.std(maes):.6f})")
-    print(f"Best sample MAPE: {np.min(mapes):.4f}%")
-    print(f"Worst sample MAPE: {np.max(mapes):.4f}%")
-
-    # Create visualization
-    fig, axes = plt.subplots(3, min(num_samples, 3), figsize=(15, 9))
-    if num_samples == 1:
-        axes = axes.reshape(3, 1)
-
-    for i in range(min(num_samples, 3)):
-        pred = predictions[i]
-        target = targets[i]
-        diff = np.abs(pred - target)
-
-        # Prediction
-        axes[0, i].imshow(pred, cmap='viridis', aspect='auto')
-        axes[0, i].set_title(f'Champion Prediction {i+1}\nMAPE: {mapes[i]:.4f}%')
-        axes[0, i].axis('off')
-
-        # Ground Truth
-        axes[1, i].imshow(target, cmap='viridis', aspect='auto')
-        axes[1, i].set_title(f'Ground Truth {i+1}')
-        axes[1, i].axis('off')
-
-        # Absolute Difference
-        axes[2, i].imshow(diff, cmap='hot', aspect='auto')
-        axes[2, i].set_title(f'Absolute Error {i+1}\nMAE: {maes[i]:.6f}')
-        axes[2, i].axis('off')
-
-    plt.tight_layout()
-    plt.suptitle('CHAMPION MODEL (0.0862% MAPE) - Visual Validation', fontsize=16, y=1.02)
-    plt.show()
+    print(f"✅ Loaded trained model from {model_path}")
+    
+    # Extract SincNet filter parameters
+    sincnet_layers = []
+    for shot_idx in range(5):
+        sinc_layer = model.temporal_encoders[shot_idx].sinc_layer
+        sincnet_layers.append(sinc_layer)
+    
+    print(f"📊 SINCNET FILTER ANALYSIS:")
+    
+    all_f_low = []
+    all_f_high = []
+    
+    for shot_idx, sinc_layer in enumerate(sincnet_layers):
+        f_low = sinc_layer.f_low.detach().cpu().numpy()
+        band_hz = sinc_layer.band_hz.detach().cpu().numpy()
+        f_high = f_low + band_hz
+        
+        all_f_low.extend(f_low)
+        all_f_high.extend(f_high)
+        
+        print(f"\n   Shot {shot_idx+1} Filters:")
+        print(f"     Low frequencies: {f_low.min():.1f} - {f_low.max():.1f} Hz")
+        print(f"     High frequencies: {f_high.min():.1f} - {f_high.max():.1f} Hz")
+        print(f"     Bandwidths: {band_hz.min():.1f} - {band_hz.max():.1f} Hz")
+        
+        # Check for frequency distribution patterns
+        low_freq_filters = np.sum(f_high < 150)
+        mid_freq_filters = np.sum((f_high >= 150) & (f_high < 200))
+        high_freq_filters = np.sum(f_high >= 200)
+        
+        print(f"     Distribution: {low_freq_filters} low (<150Hz), {mid_freq_filters} mid (150-200Hz), {high_freq_filters} high (>200Hz)")
+    
+    # Overall statistics
+    all_f_low = np.array(all_f_low)
+    all_f_high = np.array(all_f_high)
+    
+    print(f"\n📈 OVERALL FILTER STATISTICS:")
+    print(f"   Frequency range: {all_f_low.min():.1f} - {all_f_high.max():.1f} Hz")
+    print(f"   Mean low freq: {all_f_low.mean():.1f} Hz")
+    print(f"   Mean high freq: {all_f_high.mean():.1f} Hz")
+    print(f"   Mean bandwidth: {(all_f_high - all_f_low).mean():.1f} Hz")
+    
+    # Geological interpretation
+    print(f"\n🌍 GEOLOGICAL INTERPRETATION:")
+    if all_f_low.mean() > 100:
+        print("   ✅ Filters focused on higher frequencies - good for detailed structure")
+    if (all_f_high - all_f_low).mean() < 50:
+        print("   ✅ Narrow bandwidths - selective frequency learning")
+    if all_f_high.max() > 200:
+        print("   ✅ Some high-frequency filters - capturing fine details")
 
     return {
-        'predictions': predictions,
-        'targets': targets,
-        'mapes': mapes,
-        'maes': maes,
-        'summary_stats': {
-            'mean_mape': np.mean(mapes),
-            'std_mape': np.std(mapes),
-            'mean_mae': np.mean(maes),
-            'std_mae': np.std(maes)
+        'f_low_range': (all_f_low.min(), all_f_low.max()),
+        'f_high_range': (all_f_high.min(), all_f_high.max()),
+        'mean_bandwidth': (all_f_high - all_f_low).mean(),
+        'frequency_distribution': {
+            'low': np.sum(all_f_high < 150),
+            'mid': np.sum((all_f_high >= 150) & (all_f_high < 200)),
+            'high': np.sum(all_f_high >= 200)
         }
     }
 
-# =============================================================================
-# PHASE 2 PRIORITY 2: ARCHITECTURAL INNOVATIONS PREPARATION
-# =============================================================================
+# Add usage instructions
+print("🎓 Comprehensive curriculum training functions added:")
+print("   run_sincgat_full_curriculum_training(50, 10, 4)  # Full training (RECOMMENDED)")
+print("   analyze_sincgat_learned_filters()                # Post-training analysis")
 
-def prepare_architectural_experiments():
-    """Prepare for Phase 2 Priority 2: Architectural innovations using champion loss."""
+# Add the FIXED SincGAT test function
 
-    print("=" * 80)
-    print("🚀 PHASE 2 PRIORITY 2: ARCHITECTURAL INNOVATIONS")
-    print("=" * 80)
-    print("Using CHAMPION loss function as foundation for architectural experiments")
-    print(f"Champion Performance Target: 0.0862% MAPE")
-    print()
-    print("📋 PLANNED ARCHITECTURAL ENHANCEMENTS:")
-    print("1. 🔗 LightweightGATFusion: Inter-shot modeling with Graph Attention")
-    print("2. 🧱 AnisotropicConvBlock: Geological structure-aware convolutions")
-    print("3. 🔍 HyPerStructureUNet: Full integration of enhanced components")
-    print()
-    print("🎯 GOALS:")
-    print("- Push below 0.05% MAPE (98.7%+ improvement vs baseline)")
-    print("- Enhance geological realism and structure preservation")
-    print("- Maintain computational efficiency for submission")
-    print()
-    print("🔧 FOUNDATION COMPONENTS READY:")
-    print("✓ Champion loss function [1.0, 0.12, 0.007]")
-    print("✓ A100 stability optimizations")
-    print("✓ StabilizedSeismicMSSSIM")
-    print("✓ Systematic experimental framework")
-    print("=" * 80)
-
-    # Return champion loss for architectural experiments
-    champion_loss = create_champion_model()
-    champion_config = document_champion_configuration()
-
-    return champion_loss, champion_config
-
-extended_results = validate_absolute_champion_extended(num_epochs=45)
-# Document the world-class achievement
-champion_config = document_champion_configuration()
-
-# Validate visual outputs for quality assessment
-visual_results = validate_champion_visual_outputs(num_samples=5)
-
-# Prepare for architectural phase
-champion_loss, config = prepare_architectural_experiments()
-
-"""### Visualizing a Sample: Seismic Survey Data and Velocity Model
-
-Below, we visualize the **seismic survey data** (i.e., receiver data) for a selected sample, along with its corresponding **ground-truth velocity model**.
-
-The goal of this challenge is to develop a model that takes the **five receiver data inputs** (shown in the left five plots) and predicts the **velocity model** (shown in the rightmost plot). In essence, the task is to learn a mapping from seismic recordings to the underlying subsurface velocity structure.
-
-"""
-
-# Plot one dataset sample
-sample_path = sample_paths[0]
-
-source_coordinates = [1, 75, 150, 225, 300]
-
-f, ax = plt.subplots(1, 6, figsize=(10, 6))
-
-for i, s in enumerate(source_coordinates):
-    rec_data = np.load(os.path.join(sample_path, f"receiver_data_src_{s}.npy"))
-    ax[i].imshow(rec_data, cmap="gray", aspect="auto")
-    ax[i].set_title(f"src {i}")
-    ax[i].axis("off")
-
-target_data = np.load(os.path.join(sample_path, "vp_model.npy"))
-ax[-1].imshow(target_data.T, cmap="jet", aspect="auto")
-ax[-1].set_title("velocity model")
-ax[-1].axis("off")
-
-plt.tight_layout()
-plt.show()
-
-!zip -r model_backup.zip "/content/checkpoints/Extended_Absolute_Champion_epoch_40.pth"
-
-from google.colab import files
-
-
-files.download('model_backup.zip')
-
-"""## Your Solution
-Your task is summarized below.
-
-**Objective:**  
-Develop a model that takes seismic receiver data as input and predicts the corresponding subsurface velocity model.
-
-**Input:**  
-- Five 2D NumPy arrays, each with shape **(10001, 31)**  
-- These arrays represent receiver data and are of type `numpy.float32`
-
-**Output:**  
-- A single 2D NumPy array with shape **(300, 1259)**  
-- This array represents the predicted velocity model and **must** be of type `numpy.float64`
-
-# Submission File Format and Instructions
-
-To calculate your score on the predictive leaderboard, your submission must be an `.npz` file containing **150 arrays**, each representing a predicted velocity model for a test sample.
-
-- **Array Naming:** Each array should be named using the **sample ID** from the test dataset.  
-  (As explained earlier, sample IDs are the names of the folders containing the corresponding test data.)
-- **Array Content:** Each array should be your model's predicted **velocity model** for that sample.
-- **Data Type:** All arrays must be of type `numpy.float64`.
-- **File Structure:** Your `.npz` file must contain **exactly 150 items**, one for each test sample.
-
----
-
-### Creating the Submission File
-
-To help you generate the `.npz` submission file, we provide a utility function called `create_submission()` in the `utils.py` module. This function accepts:
-- A **sample ID** (as a string)
-- A **velocity model array** (as a NumPy array)
-
-You can use this function in a loop to populate your submission file with predictions for all 150 test samples.
-
-> **Important Note:**  
-> If you choose not to use the provided `create_submission()` function, ensure that your `.npz` file strictly follows the required format. A sample submission file is also provided for reference.
-
----
-
-### Demonstration
-
-Below, we demonstrate how to use the `create_submission()` function in combination with a dummy prediction function, `dummy_prediction()`, to generate a sample submission file.  
-For demonstration purposes, this example uses only **4 test samples**.
-"""
-
-test_dataset = "/content/drive/MyDrive/speed_and_structure_datatest/*"  # 'path to your test data'
-sample_paths = glob(test_dataset)
-print("Number of test samples:", len(sample_paths))
-
-for sample_path in sample_paths:
-
-    sample_id = sample_path.split("/")[-1]
-    print("\nSample ID:", sample_id)
-
-    # Load input data
-    source_coordinates = [1, 75, 150, 225, 300]
-    rec_data = [
-        np.load(os.path.join(sample_path, f"receiver_data_src_{i}.npy"))
-        for i in source_coordinates
-    ]
-
-    # Generates a dummy velocity model prediction.
-    # This line should be changed to your actual trained model for velocity model prediction
-    prediction = dummy_prediction(rec_data, output_shape=(300, 1259))
-    print("Prediction shape:", prediction.shape)
-
-    # this line creates/update the submission .npz file and populates it with sample IDs and velocity model prediction
-    create_submission(
-        sample_id, prediction, "speed-and-structure-dummy-submission1.npz"
+def run_sincgat_FIXED_curriculum_training(num_epochs=50, curriculum_epochs=10, batch_size=4):
+    """
+    🎯 CRITICAL BREAKTHROUGH VERSION: Uses FIXED SincNet (stride=10) + Anti-aliasing
+    
+    Based on deep technical analysis identifying stride=50 aliasing as the #1 bottleneck.
+    This version implements:
+    1. SincNet stride=10 (was 50) - prevents aliasing above 100Hz
+    2. Hierarchical downsampling with anti-aliasing filters
+    3. Proven curriculum learning approach
+    
+    Expected: MAJOR performance improvement, potentially beating 0.0862% champion.
+    """
+    print("="*80)
+    print("🎯 FIXED SINCGAT-UNET + CURRICULUM TRAINING")
+    print("="*80)
+    print("🚨 CRITICAL ALIASING FIX IMPLEMENTED:")
+    print("   ❌ OLD: stride=50 → aliasing above 100Hz")
+    print("   ✅ NEW: stride=10 + hierarchical downsampling")
+    print("   🎯 TARGET: Beat champion 0.0862% MAPE")
+    print("="*80)
+    
+    # Import required modules
+    try:
+        import torch_geometric
+        from complete_sincgat_unet_integration import CompleteSincGAT_UNet, configure_a100_stability
+        print("✅ Successfully imported FIXED SincGAT-UNet modules")
+    except ImportError as e:
+        print(f"❌ Failed to import required modules: {e}")
+        return None
+    
+    # Setup data loaders with proven stable configuration
+    train_loader, val_loader = setup_phase2_data_loaders(
+        test_size=0.2, 
+        batch_size=batch_size,
+        num_workers=0,
+        random_state=42
     )
+    
+    if train_loader is None or val_loader is None:
+        print("❌ Failed to setup data loaders")
+        return None
+    
+    # Configure A100 stability
+    if device.type == 'cuda':
+        configure_a100_stability(disable_tf32=True)
+        print("✅ A100 stability configured")
+    
+    # Create FIXED CompleteSincGAT_UNet
+    print("🔧 Initializing FIXED CompleteSincGAT_UNet...")
+    model = CompleteSincGAT_UNet(
+        sample_rate=10001,          # Critical: 10001 Hz 
+        num_receivers=31,
+        time_samples=10001,
+        num_shots=5,
+        sinc_out_channels=40,
+        sinc_kernel_size=251,
+        sinc_stride=10,             # 🎯 CRITICAL FIX: Was 50, now 10
+        sinc_min_low_hz=80,         # Geophysically relevant
+        sinc_min_band_hz=10,
+        shot_embedding_dim=128,
+        gat_hidden_per_head=32,
+        gat_num_heads=4,
+        fused_embedding_dim=128,
+        n_unet_output_channels=1
+    ).to(device)
+    
+    param_count = sum(p.numel() for p in model.parameters())
+    print(f"📊 FIXED Model parameters: {param_count:,}")
+    
+    # Create champion curriculum hybrid loss
+    print("🏆 Setting up champion curriculum hybrid loss...")
+    criterion = RefinedLogSpaceMAEHybridLoss(
+        min_velocity=1.5,
+        use_adaptive_softadapt=False,
+        logmae_momentum=0,
+        initial_c_logmae=0.1,
+        fixed_weights_list=[1.0, 0.12, 0.007],  # Champion weights
+        start_simple=True,                       # CURRICULUM approach
+        curriculum_epochs=curriculum_epochs,
+        ms_ssim_apply_log=True,
+        ms_ssim_data_range_log=2.0,
+        ms_ssim_c_log=0.1,
+        atv_weight_h=1.0,
+        atv_weight_v=0.3
+    ).to(device)
+    
+    # Create optimizer with champion settings
+    optimizer = optim.AdamW(
+        model.parameters(), 
+        lr=1e-4,
+        weight_decay=0.01,
+        betas=(0.9, 0.999)
+    )
+    
+    print("🚀 Starting FIXED curriculum training...")
+    print(f"   Architecture: FIXED CompleteSincGAT_UNet")
+    print(f"   🎯 KEY FIX: SincNet stride 50→10 + anti-aliasing")
+    print(f"   Loss: Champion curriculum hybrid loss")
+    print(f"   Training plan:")
+    print(f"     Phase 1 (1-{curriculum_epochs}): LogMAE foundation")
+    print(f"     Phase 2 ({curriculum_epochs+1}-{num_epochs}): Full hybrid [1.0, 0.12, 0.007]")
+    
+    # Execute training with curriculum support
+    results = train_with_curriculum_fixed(
+        experiment_name="SincGAT_UNet_FIXED_Curriculum",
+        model=model,
+        train_loader=train_loader,
+        val_loader=val_loader, 
+        criterion=criterion,
+        optimizer=optimizer,
+        num_epochs=num_epochs,
+        device=device,
+        calculate_mape_func=calculate_mape
+    )
+    
+    print("="*80)
+    print("🎯 FIXED SINCGAT-UNET TRAINING COMPLETE")
+    if isinstance(results, (list, tuple)) and len(results) > 0:
+        best_mape = results[0]
+        print(f"🏆 FIXED Architecture MAPE: {best_mape:.4f}%")
+        
+        # Performance comparison
+        champion_mape = 0.0862
+        curriculum_mape = 0.1668  # Previous curriculum result with aliasing
+        
+        if best_mape < champion_mape:
+            improvement = champion_mape / best_mape
+            print(f"🎉 NEW WORLD RECORD! {improvement:.2f}x better than champion!")
+        elif best_mape < curriculum_mape:
+            improvement = curriculum_mape / best_mape
+            print(f"🚀 ALIASING FIX SUCCESS! {improvement:.2f}x better than aliased version!")
+        
+        print(f"📊 Performance Comparison:")
+        print(f"   🏆 Champion BaselineUNet: 0.0862%")
+        print(f"   📈 SincGAT (aliased): 0.1668%")
+        print(f"   🎯 SincGAT (FIXED): {best_mape:.4f}%")
+        
+    print("="*80)
+    
+    return results
 
-"""# Evaluation Metric: Mean Absolute Percentage Error (MAPE)
-
-Model performance is evaluated using the **Mean Absolute Percentage Error (MAPE)**. For each test sample, MAPE is computed between your predicted velocity model and the ground-truth model using the following formula:
-
-$$
-\text{MAPE} = \frac{1}{N} \sum_{i,j} \left| \frac{g(i,j) - p(i,j)}{g(i,j)} \right|
-$$
-
-Where:
-- $N$ is the total number of elements in the velocity model array  
-- $g(i,j)$ is the ground-truth velocity at position $(i, j)$  
-- $p(i,j)$ is the predicted velocity at the same position  
-- Note: $g(i,j) > 0$ for all $(i, j)$
-
-After computing MAPE for each of the 150 test samples, the final leaderboard score is obtained by averaging the MAPE values across all samples.
-
----
-
-### Utility Functions for Evaluation
-
-To help you better understand how your predictive leaderboard score is calculated, two utility functions are provided in the `utils.py` module:
-
-1. **`calculate_mape()`**  
-   Computes the MAPE for a single sample, given the ground-truth and predicted velocity models.
-
-2. **`calculate_score()`**  
-   Accepts the ground-truth and submission `.npz` files, calculates the MAPE for each sample, and returns the average MAPE as your final score.
-
----
-
-### Demonstration
-
-Below, we demonstrate the use of `calculate_score()` by applying it to two dummy `.npz` submission files. These files were generated using the loop described earlier. One file is treated as the ground-truth, and the other as the prediction.
-
-"""
-
-answerkey_file = "./speed-and-structure-dummy-submission1.npz"
-submission_file = "./speed-and-structure-dummy-submission2.npz"
-
-calculate_score(answerkey_file, submission_file)
-
-"""And the error will obviously be zero if the ground-truth and prediction arrays are exactly the same!"""
-
-calculate_score(answerkey_file, answerkey_file)
-
-"""# Submission Requirements and Guidelines for Smooth Evaluation
-
-To ensure that your submission can be evaluated smoothly and efficiently, please follow these guidelines. Adhering to these best practices will help us run your code without issues and will also reflect positively on your submission. Failure to comply with these best practices may result in disqualification or delays in the evaluation of your submission.
-
-#### 1. Documentation
-- **README Files**: Include a README.md file that provides an overview of your project, instructions on how to run your code, and any other relevant information.
-- **Docstrings**: Ensure that all functions and classes have clear and concise docstrings explaining their purpose and usage.
-- **Markdown Cells**: Use markdown cells in your Jupyter Notebook to explain the steps of your workflow, the rationale behind your choices, and any important details.
-
-#### 2. Environment Management
-- **Document the Environment**: Clearly document the computing environment, including the operating system, Python version, and any other relevant details.
-- **Dependencies**: Provide a detailed list of all required libraries and their versions in a `requirements.txt` file.
-- **Reproducibility**: Before submission, create a clean environment using your `requirements.txt` file and ensure that your code runs without errors in this environment.
-
-#### 3. Folder Organization and Code Modularity
-- **Folder Structure**: Organize your project files logically. Separate scripts, data, models, and documentation into distinct folders.
-- **Modular Code**: Write modular code by separating different stages of your workflow (e.g., data loading, preprocessing, training, inference) into distinct functions or modules.
-- **Avoid Hard-Coding Paths**: Avoid hard-coding paths, especially data paths. Use variables for data path or configuration files to specify paths, ensuring that your code can run on different machines without modification.
-
-#### 4. Workflow Orchestration
-- **Main Script**: Use a main Jupyter Notebook to orchestrate the workflow. This Notebook should call the necessary functions or modules in the correct order and provide a clear overview of the entire process.
-
-#### 5. Model Checkpoints
-- **Save Checkpoints**: Save and include trained model checkpoints in your submission.
-- **Instructions**: Provide clear instructions on how to save, load, and use the model checkpoints, preferably in your README.md file.
-
-#### 6. Double-Check Files
-- **Include Necessary Files**: Ensure that all necessary files are included in your submission. This includes the license, notebook, `requirements.txt`, model checkpoints, and any other essential files.
-- **Exclude Unnecessary Files**: Exclude unnecessary files such as training and test data to keep your submission clean and focused, and smaller in size.
-
-# Final Evaluation Criteria
-
-If you are selected to send your code and files for the final evaluation, 90% of your final score will be based on your model's MAPE score on the private holdout dataset. The remaining 10% will depend on how well you follow the above-mentioned guidelines. This means that thorough documentation, proper environment management, good folder organization, modular code, and the inclusion of all necessary files are crucial for your success.
-
-
-To highlight and encourage innovation in this challenge, we are offering **two honorable mentions**—each accompanied by **prize money**—for the **top two most novel and valid approaches** submitted. These awards aim to recognize creative strategies that go beyond conventional solutions, regardless of leaderboard ranking.
-
-
-By strictly following these guidelines, you will help us evaluate your submission more effectively and increase the chances of your work being recognized. Non-compliance with these requirements may lead to your submission being rejected or not evaluated properly. <b>Thank you for your attention to details and good luck with the challenge!</b>
-"""
+# Add usage instructions  
+print("🎯 CRITICAL FIX: Anti-aliasing SincGAT functions added:")
+print("   run_sincgat_FIXED_curriculum_training(50, 10, 4)  # BREAKTHROUGH VERSION")

@@ -226,7 +226,9 @@ class SeismicSincNetGAT(nn.Module):
                  sinc_out_channels=40,
                  sinc_kernel_size=251,
                  sinc_stride=50,
-                 sample_rate=500,  # UPDATED: 500 Hz based on research
+                 sample_rate=10001,  # UPDATED: 10001 Hz based on 1s = 10001 samples
+                 min_low_hz=80,       # UPDATED: Based on kernel size constraints
+                 min_band_hz=10,      # UPDATED: Larger minimum bandwidth
                  shot_embedding_dim=128,
                  # GAT parameters
                  gat_hidden_per_head=32,
@@ -249,6 +251,8 @@ class SeismicSincNetGAT(nn.Module):
             sinc_kernel_size=sinc_kernel_size,
             sinc_stride=sinc_stride,
             sample_rate=sample_rate,
+            min_low_hz=min_low_hz,
+            min_band_hz=min_band_hz,
             embedding_dim=shot_embedding_dim
         )
         
@@ -343,7 +347,9 @@ def test_seismic_sincnet_gat():
         sinc_out_channels=40,
         sinc_kernel_size=251,
         sinc_stride=50,
-        sample_rate=500,
+        sample_rate=10001,  # Updated sample rate
+        min_low_hz=80,      # Updated minimum frequency
+        min_band_hz=10,     # Updated minimum bandwidth
         shot_embedding_dim=128,
         gat_hidden_per_head=32,
         gat_num_heads=4,
