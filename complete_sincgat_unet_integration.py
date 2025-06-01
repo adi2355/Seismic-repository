@@ -293,7 +293,7 @@ class CompleteSincGAT_UNet(nn.Module):
         )
         
         # Graph builder to create shot-to-shot relationships
-        self.graph_builder = ShotGraphBuilder(num_shots)
+        self.shot_graph_builder = ShotGraphBuilder(num_shots)
         
         # GAT fusion module
         self.gat_fusion = LightweightGATFusion(
@@ -347,53 +347,195 @@ class CompleteSincGAT_UNet(nn.Module):
     
     def forward(self, x_all_shots_batch):
         """
-        Forward pass through complete architecture
-        
-        Args:
-            x_all_shots_batch: (B, 5, 10001, 31) - Batch of 5-shot gathers
-            
-        Returns:
-            velocity_models: (B, 1, 300, 1259) - Predicted velocity models
+        Forward pass through the complete SincGAT-UNet architecture.
         """
-        # Validate input shape
-        B, shots, time, receivers = x_all_shots_batch.shape
-        if shots != self.num_shots:
-            raise ValueError(f"Expected {self.num_shots} shots, got {shots}")
-        if time != self.time_samples:
-            raise ValueError(f"Expected {self.time_samples} time samples, got {time}")
-        if receivers != self.num_receivers:
-            raise ValueError(f"Expected {self.num_receivers} receivers, got {receivers}")
+        B, num_shots, time_samples, num_receivers = x_all_shots_batch.shape
         
-        device = x_all_shots_batch.device
-        
-        # 1. Per-Shot Encoding with SincNet
+        # Step 1: Extract embeddings from all shots using PerShotTemporalEncoder
         shot_embeddings_list = []
-        for i in range(self.num_shots):
-            current_shot_data = x_all_shots_batch[:, i, :, :]  # (B, 10001, 31)
-            shot_embedding = self.shot_encoder(current_shot_data)  # (B, shot_embedding_dim)
+        for i in range(num_shots):
+            current_shot_data = x_all_shots_batch[:, i, :, :]  # (B, time_samples, num_receivers)
+            shot_embedding = self.shot_encoder(current_shot_data)  # (B, embedding_dim)
             shot_embeddings_list.append(shot_embedding)
         
-        # Stack embeddings: (B, num_shots, shot_embedding_dim)
-        shot_embeddings_batch = torch.stack(shot_embeddings_list, dim=1)
+        shot_embeddings_batch = torch.stack(shot_embeddings_list, dim=1)  # (B, num_shots, embedding_dim)
         
-        # 2. Create graph batch for GAT
-        x_nodes, edge_index, batch_vector = self.graph_builder.create_batch(shot_embeddings_batch)
+        # STRATEGIC DEBUGGING: Track training progress without cluttering logs
+        if self.training:
+            if not hasattr(self, '_debug_step_count'):
+                self._debug_step_count = 0
+                self._debug_epoch = 0
+                self._debug_batch_in_epoch = 0
+            
+            self._debug_step_count += 1
+            self._debug_batch_in_epoch += 1
+            
+            # Debug conditions: First 3 batches of first 3 epochs, then every 50 batches, then first/last batch of each epoch
+            should_debug = (
+                (self._debug_epoch < 3 and self._debug_batch_in_epoch <= 3) or  # Early training details
+                (self._debug_step_count % 50 == 0) or  # Periodic checks
+                (self._debug_batch_in_epoch == 1) or  # First batch of epoch
+                (hasattr(self, '_is_last_batch') and self._is_last_batch)  # Last batch of epoch
+            )
+            
+            if should_debug:
+                print(f"\n🔍 DEBUG [Epoch {self._debug_epoch+1}, Batch {self._debug_batch_in_epoch}, Global {self._debug_step_count}]:")
+                print(f"   📊 Shot Embeddings: shape={shot_embeddings_batch.shape}")
+                print(f"      Mean: {shot_embeddings_batch.mean().item():.4f}, Std: {shot_embeddings_batch.std().item():.4f}")
+                print(f"      Range: [{shot_embeddings_batch.min().item():.3f}, {shot_embeddings_batch.max().item():.3f}]")
+                
+                # Check for problems
+                if torch.isnan(shot_embeddings_batch).any():
+                    print(f"      ⚠️  NaN detected in shot embeddings!")
+                if torch.isinf(shot_embeddings_batch).any():
+                    print(f"      ⚠️  Inf detected in shot embeddings!")
+                if shot_embeddings_batch.std().item() < 1e-6:
+                    print(f"      ⚠️  Very low variance - embeddings collapsed!")
+                if shot_embeddings_batch.abs().max().item() > 100:
+                    print(f"      ⚠️  Very large values - potential explosion!")
+        
+        # Step 2: Prepare graph data for GAT fusion
+        x_nodes, edge_index, batch_vector = self.shot_graph_builder.create_batch(shot_embeddings_batch)
+        
+        # Move to correct device
+        device = x_all_shots_batch.device
         edge_index = edge_index.to(device)
         batch_vector = batch_vector.to(device)
         
-        # 3. GAT fusion
-        gat_fused_vector = self.gat_fusion(x_nodes, edge_index, batch_vector)  # (B, fused_embedding_dim)
+        # Step 3: Apply GAT fusion to create a single fused embedding per batch
+        fused_embedding = self.gat_fusion(x_nodes, edge_index, batch_vector)  # (B, fused_embedding_dim)
+        
+        # Debug GAT fusion output
+        if self.training and should_debug:
+            print(f"   🔗 GAT Fusion: shape={fused_embedding.shape}")
+            print(f"      Mean: {fused_embedding.mean().item():.4f}, Std: {fused_embedding.std().item():.4f}")
+            print(f"      Range: [{fused_embedding.min().item():.3f}, {fused_embedding.max().item():.3f}]")
+            
+            if torch.isnan(fused_embedding).any():
+                print(f"      ⚠️  NaN detected in GAT output!")
+            if torch.isinf(fused_embedding).any():
+                print(f"      ⚠️  Inf detected in GAT output!")
         
         # 4. U-Net encoder path
         x1, x2, x3, x4, x5 = self.unet.forward_encoder(x_all_shots_batch)
         
+        # Debug U-Net encoder bottleneck
+        if self.training and should_debug:
+            print(f"   🏗️  U-Net Bottleneck (x5): shape={x5.shape}")
+            print(f"      Mean: {x5.mean().item():.4f}, Std: {x5.std().item():.4f}")
+            print(f"      Range: [{x5.min().item():.3f}, {x5.max().item():.3f}]")
+        
         # 5. GAT-UNet integration at bottleneck
-        enhanced_bottleneck = self.gat_unet_integration(x5, gat_fused_vector)
+        enhanced_bottleneck = self.gat_unet_integration(x5, fused_embedding)
+        
+        # Debug enhanced bottleneck
+        if self.training and should_debug:
+            print(f"   🔀 Enhanced Bottleneck: shape={enhanced_bottleneck.shape}")
+            print(f"      Mean: {enhanced_bottleneck.mean().item():.4f}, Std: {enhanced_bottleneck.std().item():.4f}")
+            print(f"      Range: [{enhanced_bottleneck.min().item():.3f}, {enhanced_bottleneck.max().item():.3f}]")
         
         # 6. U-Net decoder path with enhanced bottleneck
-        velocity_models = self.unet.forward_decoder(enhanced_bottleneck, x4, x3, x2, x1)
+        velocity_prediction = self.unet.forward_decoder(enhanced_bottleneck, x4, x3, x2, x1)
         
-        return velocity_models
+        # Debug final output
+        if self.training and should_debug:
+            print(f"   🎯 Final Prediction: shape={velocity_prediction.shape}")
+            print(f"      Mean: {velocity_prediction.mean().item():.4f}, Std: {velocity_prediction.std().item():.4f}")
+            print(f"      Range: [{velocity_prediction.min().item():.3f}, {velocity_prediction.max().item():.3f}]")
+            
+            if torch.isnan(velocity_prediction).any():
+                print(f"      ⚠️  NaN detected in final prediction!")
+            if torch.isinf(velocity_prediction).any():
+                print(f"      ⚠️  Inf detected in final prediction!")
+        
+        return velocity_prediction
+    
+    def start_new_epoch(self, epoch_num):
+        """Call this at the start of each epoch to update debugging counters"""
+        if hasattr(self, '_debug_epoch'):
+            self._debug_epoch = epoch_num
+            self._debug_batch_in_epoch = 0
+    
+    def mark_last_batch(self):
+        """Call this to mark the current batch as the last batch of the epoch"""
+        if hasattr(self, '_is_last_batch'):
+            self._is_last_batch = True
+        else:
+            self._is_last_batch = True
+    
+    def unmark_last_batch(self):
+        """Call this to unmark the last batch flag"""
+        if hasattr(self, '_is_last_batch'):
+            self._is_last_batch = False
+    
+    def debug_gradients(self):
+        """Monitor gradient flow through the network"""
+        if not self.training:
+            return
+            
+        print(f"   🔄 Gradient Analysis:")
+        
+        # Check SincNet gradients
+        if hasattr(self.shot_encoder.sinc_layer, 'f_center_norm') and self.shot_encoder.sinc_layer.f_center_norm.grad is not None:
+            center_grad = self.shot_encoder.sinc_layer.f_center_norm.grad
+            print(f"      SincNet Center Freq Grad: mean={center_grad.mean().item():.6f}, std={center_grad.std().item():.6f}")
+            if center_grad.abs().max().item() < 1e-8:
+                print(f"      ⚠️  Very small SincNet gradients - possible vanishing!")
+            elif center_grad.abs().max().item() > 1.0:
+                print(f"      ⚠️  Large SincNet gradients - possible exploding!")
+        else:
+            print(f"      ⚠️  No SincNet gradients found!")
+        
+        # Check GAT gradients
+        gat_params_with_grad = [p for p in self.gat_fusion.parameters() if p.grad is not None]
+        if gat_params_with_grad:
+            gat_grad_norm = torch.norm(torch.stack([torch.norm(p.grad.detach()) for p in gat_params_with_grad]))
+            print(f"      GAT Grad Norm: {gat_grad_norm.item():.6f}")
+        else:
+            print(f"      ⚠️  No GAT gradients found!")
+        
+        # Check U-Net gradients
+        unet_params_with_grad = [p for p in self.unet.parameters() if p.grad is not None]
+        if unet_params_with_grad:
+            unet_grad_norm = torch.norm(torch.stack([torch.norm(p.grad.detach()) for p in unet_params_with_grad]))
+            print(f"      U-Net Grad Norm: {unet_grad_norm.item():.6f}")
+        else:
+            print(f"      ⚠️  No U-Net gradients found!")
+    
+    def debug_sincnet_filters(self):
+        """Monitor SincNet filter evolution"""
+        if not self.training:
+            return
+            
+        # Get current filter frequencies
+        f_low, f_high = self.shot_encoder.sinc_layer._get_current_cutoffs()
+        nyquist = self.shot_encoder.sinc_layer.sample_rate / 2.0
+        
+        f_low_hz = f_low.squeeze() * nyquist
+        f_high_hz = f_high.squeeze() * nyquist
+        bandwidth_hz = f_high_hz - f_low_hz
+        
+        print(f"   🎵 SincNet Filter Status:")
+        print(f"      Frequency Range: {f_low_hz.min().item():.1f} - {f_high_hz.max().item():.1f} Hz")
+        print(f"      Mean Bandwidth: {bandwidth_hz.mean().item():.1f} Hz")
+        print(f"      Filters <100Hz: {(f_high_hz < 100).sum().item()}/{len(f_high_hz)}")
+        print(f"      Filters >500Hz: {(f_low_hz > 500).sum().item()}/{len(f_low_hz)}")
+        
+        # Check for problematic filter configurations
+        if (bandwidth_hz < 5).any():
+            print(f"      ⚠️  Some filters have very narrow bandwidth (<5Hz)!")
+        if (f_high_hz > nyquist * 0.95).any():
+            print(f"      ⚠️  Some filters are very close to Nyquist!")
+    
+    def epoch_summary(self, epoch, train_loss, val_mape):
+        """Print epoch summary with key metrics"""
+        print(f"\n📈 EPOCH {epoch+1} SUMMARY:")
+        print(f"   Train Loss: {train_loss:.6f}")
+        print(f"   Val MAPE: {val_mape:.4f}%")
+        
+        # Add filter status every 5 epochs
+        if (epoch + 1) % 5 == 0:
+            self.debug_sincnet_filters()
 
 
 # =====================================
@@ -495,10 +637,10 @@ def test_complete_model(sample_rate=10001, device='cuda' if torch.cuda.is_availa
             # Check for numerical stability
             if torch.isnan(velocity_models).any():
                 print("❌ NaN detected!")
-                return False
+                return False, model, info
             elif torch.isinf(velocity_models).any():
                 print("❌ Inf detected!")
-                return False
+                return False, model, info
             else:
                 print("✅ Numerically stable")
         

@@ -35,12 +35,12 @@ class SincConv1d_SeismicAdapted(nn.Module):
                  window_func='blackman', # Recommended: 'blackman'
                  initialization_type='logarithmic'): # Recommended: 'logarithmic'
         super().__init__()
-
+        
         if in_channels != 1:
             raise ValueError("SincConv1d_SeismicAdapted only supports in_channels=1")
         if kernel_size % 2 == 0:
             raise ValueError("kernel_size must be odd")
-
+        
         self.out_channels = out_channels
         self.kernel_size = kernel_size
         self.sample_rate = float(sample_rate) # Ensure float for division
@@ -89,57 +89,55 @@ class SincConv1d_SeismicAdapted(nn.Module):
         print(f"   Target Freq. Range (init): [{self.min_low_hz:.1f} - {self.max_learnable_hz:.1f}] Hz ({self.initialization_type} spacing)")
 
     def _initialize_filter_params(self):
-        nyquist = self.sample_rate / 2.0
-        min_representable_f_for_kernel = self.sample_rate / self.kernel_size # Approx. if 1 cycle in kernel
+        # Calculate effective frequency bounds based on kernel size
+        # With kernel_size=1001 and sample_rate=10001, we can theoretically resolve down to ~10-20 Hz
+        effective_resolution_hz = self.sample_rate / self.kernel_size  # ~10 Hz for 1001-point kernel
+        actual_min_low_hz = max(self.min_low_hz, effective_resolution_hz * 2)  # Safety factor
+        actual_max_learnable_hz = min(self.max_learnable_hz, self.sample_rate / 2.0 - 50)  # Leave margin from Nyquist
         
-        actual_min_low_hz = max(self.min_low_hz, min_representable_f_for_kernel)
-        actual_max_learnable_hz = min(self.max_learnable_hz, nyquist - self.min_band_hz) # Ensure band fits
-
-        if actual_max_learnable_hz <= actual_min_low_hz:
-            raise ValueError(f"Invalid frequency range for SincNet: min_low_hz={actual_min_low_hz}, max_learnable_hz={actual_max_learnable_hz}")
-
-        center_freqs_hz = []
-        bandwidths_hz = []
-
+        print(f"🔧 SincConv1d_SeismicAdapted Initialized:")
+        print(f"   Sample Rate: {self.sample_rate} Hz")
+        print(f"   Kernel Size: {self.kernel_size} samples ({self.kernel_size/self.sample_rate*1000:.1f} ms)")
+        print(f"   Stride: {self.stride}")
+        print(f"   Filters: {self.out_channels}, Window: {self.window_func}")
+        print(f"   Target Freq. Range (init): [{actual_min_low_hz:.1f} - {actual_max_learnable_hz:.1f}] Hz ({self.initialization_type} spacing)")
+        
         if self.initialization_type == 'logarithmic':
-            # Ensure positive values for logspace
-            log_min = np.log10(max(1.0, actual_min_low_hz + self.min_band_hz / 2.0)) # Start slightly above min_low for center
-            log_max = np.log10(max(1.0, actual_max_learnable_hz - self.min_band_hz / 2.0)) # End slightly below max_learnable for center
-            if log_max <= log_min: # Fallback if range too small for log
-                 center_freqs_hz_init = np.linspace(actual_min_low_hz + self.min_band_hz/2, 
-                                                 actual_max_learnable_hz - self.min_band_hz/2, 
-                                                 self.out_channels)
+            # Use log spacing if range is sufficient
+            log_range = actual_max_learnable_hz / actual_min_low_hz
+            if log_range > 2.0:  # Minimum for meaningful log spacing
+                center_freqs_hz_init = np.logspace(
+                    np.log10(actual_min_low_hz), 
+                    np.log10(actual_max_learnable_hz), 
+                    self.out_channels
+                )
             else:
-                center_freqs_hz_init = np.logspace(log_min, log_max, self.out_channels)
-        else: # Linear
-            center_freqs_hz_init = np.linspace(actual_min_low_hz + self.min_band_hz/2.0, 
-                                             actual_max_learnable_hz - self.min_band_hz/2.0, 
-                                             self.out_channels)
+                print(f"   Warning: Log range {log_range:.2f} too small, using linear spacing")
+                center_freqs_hz_init = np.linspace(actual_min_low_hz, actual_max_learnable_hz, self.out_channels)
+        else:
+            # Linear spacing
+            center_freqs_hz_init = np.linspace(actual_min_low_hz, actual_max_learnable_hz, self.out_channels)
         
-        # Initialize bandwidths (e.g., as a fraction of center frequency or a fixed small value + min_band_hz)
-        for fc_hz in center_freqs_hz_init:
-            # Example: bandwidth proportional to center freq (constant Q-like), but at least min_band_hz
-            # For robust initialization, start with a slightly larger band than min_band_hz
-            bw_hz = max(self.min_band_hz, fc_hz * 0.1) # e.g. 10% of center freq
-            
-            # Ensure f_low and f_high are within limits
-            f_low_test = fc_hz - bw_hz / 2.0
-            f_high_test = fc_hz + bw_hz / 2.0
+        # Initialize bandwidths: use 10% of center frequency but ensure minimum bandwidth
+        bandwidths_hz_init = np.maximum(self.min_band_hz, center_freqs_hz_init * 0.1)
+        
+        # Ensure filters don't exceed the valid range when bandwidth is added
+        max_allowed_bw = 2 * (actual_max_learnable_hz - center_freqs_hz_init)
+        bandwidths_hz_init = np.minimum(bandwidths_hz_init, max_allowed_bw)
+        bandwidths_hz_init = np.maximum(bandwidths_hz_init, self.min_band_hz)  # Ensure minimum
+        
+        # CRITICAL FIX: Normalize by Nyquist frequency, not sample_rate
+        nyquist = self.sample_rate / 2.0  # This is the key fix!
+        
+        # Convert to normalized parameters (0 to 1.0, where 1.0 = Nyquist)
+        self.f_center_norm.data = torch.tensor(center_freqs_hz_init, dtype=torch.float32).view(-1,1) / nyquist
+        self.f_bandwidth_norm.data = torch.tensor(bandwidths_hz_init, dtype=torch.float32).view(-1,1) / nyquist
 
-            if f_low_test < actual_min_low_hz:
-                bw_hz = 2 * (fc_hz - actual_min_low_hz)
-            if f_high_test > actual_max_learnable_hz:
-                bw_hz = 2 * (actual_max_learnable_hz - fc_hz)
-            
-            bw_hz = max(bw_hz, self.min_band_hz) # Ensure min_band_hz
-
-            center_freqs_hz.append(fc_hz)
-            bandwidths_hz.append(bw_hz)
-
-        # Convert to normalized parameters (0 to 0.5) and initialize nn.Parameter
-        with torch.no_grad():
-            self.f_center_norm.data = torch.tensor(center_freqs_hz, dtype=torch.float32).view(-1,1) / self.sample_rate
-            self.f_bandwidth_norm.data = torch.tensor(bandwidths_hz, dtype=torch.float32).view(-1,1) / self.sample_rate
+        # DEBUG VERIFICATION: Print normalization values to confirm Nyquist fix is active
+        print(f"   🔍 SINCNET DEBUG: Nyquist freq = {nyquist:.1f} Hz")
+        print(f"   🔍 SINCNET DEBUG: f_center_norm min={self.f_center_norm.data.min().item():.4f}, max={self.f_center_norm.data.max().item():.4f}")
+        print(f"   🔍 SINCNET DEBUG: f_bandwidth_norm min={self.f_bandwidth_norm.data.min().item():.4f}, max={self.f_bandwidth_norm.data.max().item():.4f}")
+        print(f"   🔍 SINCNET DEBUG: Expected f_center_norm max ≈ {actual_max_learnable_hz/nyquist:.4f} (if Nyquist norm is correct)")
 
     def _get_time_vector(self):
         n = (self.kernel_size - 1) // 2
@@ -151,20 +149,20 @@ class SincConv1d_SeismicAdapted(nn.Module):
         f_c_norm = torch.abs(self.f_center_norm) 
         f_bw_norm = torch.abs(self.f_bandwidth_norm)
 
-        # Ensure bandwidth is at least min_band_hz (normalized)
-        min_b_norm = self.min_band_hz / self.sample_rate
+        # Ensure bandwidth is at least min_band_hz (normalized by Nyquist)
+        nyquist = self.sample_rate / 2.0
+        min_b_norm = self.min_band_hz / nyquist
         f_bw_norm = torch.clamp(f_bw_norm, min=min_b_norm)
 
         f_low_norm = f_c_norm - f_bw_norm / 2.0
         f_high_norm = f_c_norm + f_bw_norm / 2.0
 
-        # Clamp to [0, 0.5] (normalized Nyquist)
-        f_low_norm = torch.clamp(f_low_norm, min=0.0, max=0.5 - min_b_norm) # ensure high can be higher
+        # Clamp to [0, 1.0] where 1.0 = Nyquist frequency
+        f_low_norm = torch.clamp(f_low_norm, min=0.0, max=1.0 - min_b_norm) # ensure high can be higher
         
-        # Using torch.maximum/minimum for tensor bounds
-        min_bound = f_low_norm + min_b_norm
-        max_bound = torch.ones_like(f_high_norm) * 0.5
-        f_high_norm = torch.minimum(torch.maximum(f_high_norm, min_bound), max_bound)
+        # Using torch.maximum for proper tensor operations with 1.0 representing Nyquist
+        f_high_norm = torch.minimum(f_high_norm, torch.ones_like(f_high_norm) * 1.0)
+        f_high_norm = torch.maximum(f_high_norm, f_low_norm + min_b_norm) # ensure minimum bandwidth
         
         return f_low_norm, f_high_norm
 
@@ -225,61 +223,134 @@ class SincConv1d_SeismicAdapted(nn.Module):
 
 # Anti-Aliasing Modules
 class BlurPool1D(nn.Module):
-    """1D anti-aliasing module using binomial filter followed by strided subsampling"""
-    def __init__(self, channels, filt_size=3, stride=2):
+    """1D anti-aliasing module using Gaussian filters followed by strided subsampling
+    
+    OPTIMIZED VERSION based on research findings:
+    - For 5x+ downsampling: Use 9-11 taps with σ≈2.5-3.0
+    - For 4x downsampling: Use 7-9 taps with σ≈2.0-2.5  
+    - For 2x downsampling: Use 5-7 taps with σ≈1.0-1.5
+    """
+    def __init__(self, channels, filt_size=None, stride=2, sigma=None):
         super().__init__()
         self.channels = channels
-        self.filt_size = filt_size
         self.stride = stride
-        self.padding = (filt_size - 1) // 2
-
-        # Simple binomial-like filter [0.25, 0.5, 0.25] for filt_size=3
-        # Or [1/16, 4/16, 6/16, 4/16, 1/16] for filt_size=5
-        if filt_size == 3:
-            a = torch.tensor([1., 2., 1.])
-        elif filt_size == 5:
-            a = torch.tensor([1., 4., 6., 4., 1.])
-        else: # Default to average/box for other sizes
-            a = torch.ones(filt_size)
         
-        filt = (a / a.sum()).view(1, 1, filt_size).repeat(channels, 1, 1)
+        # RESEARCH-BASED OPTIMIZATION: Auto-select filter size and sigma based on stride
+        if filt_size is None:
+            # Auto-select optimal filter size based on downsampling factor
+            if stride >= 5:
+                self.filt_size = 11  # 11-tap for 5x+ downsampling
+            elif stride >= 4:
+                self.filt_size = 9   # 9-tap for 4x downsampling  
+            elif stride >= 3:
+                self.filt_size = 7   # 7-tap for 3x downsampling
+            else:
+                self.filt_size = 5   # 5-tap for 2x downsampling
+        else:
+            self.filt_size = filt_size
+            
+        self.padding = (self.filt_size - 1) // 2
+        
+        # RESEARCH-BASED SIGMA OPTIMIZATION
+        if sigma is None:
+            # Optimized sigma values based on research for different downsampling factors
+            if stride >= 5:
+                self.sigma = 3.0    # σ=3.0 for 5x+ (strong low-pass filtering)
+            elif stride >= 4:
+                self.sigma = 2.5    # σ=2.5 for 4x 
+            elif stride >= 3:
+                self.sigma = 2.0    # σ=2.0 for 3x
+            else:
+                self.sigma = max(1.0, stride / 2.0)  # σ≈1.0-1.5 for 2x
+        else:
+            self.sigma = sigma
+        
+        # Generate Gaussian filter weights with optimized parameters
+        coords = torch.arange(self.filt_size, dtype=torch.float32)
+        coords -= (self.filt_size - 1) / 2.0
+        g = torch.exp(-(coords ** 2) / (2 * self.sigma ** 2))
+        g_norm = g / g.sum()
+        
+        filt = g_norm.view(1, 1, self.filt_size).repeat(channels, 1, 1)
         self.register_buffer('filt', filt)
-
+        
+        # Debug info for optimization verification
+        print(f"      BlurPool1D: {stride}x stride → {self.filt_size}-tap filter, σ={self.sigma:.1f}")
+            
     def forward(self, x):
         # x shape: (Batch, Channels, Time)
-        # Apply depthwise convolution with the blur filter
+        # Apply depthwise convolution with the Gaussian blur filter
         blurred_x = F.conv1d(x, self.filt, stride=1, padding=self.padding, groups=self.channels)
         # Downsample
         return blurred_x[:, :, ::self.stride]
 
 
 class BlurPool2D(nn.Module):
-    """2D anti-aliasing module using separable binomial filters followed by strided subsampling"""
-    def __init__(self, channels, filt_size=3, stride=(2,2)):
+    """2D anti-aliasing module using separable Gaussian filters followed by strided subsampling
+    
+    OPTIMIZED VERSION based on research findings:
+    - For 5x downsampling: Use 9-11 taps with σ≈2.5-3.0 for ~-10dB attenuation at new Nyquist
+    - For 4x downsampling: Use 7-9 taps with σ≈2.0-2.5  
+    - For 2x downsampling: Use 5-7 taps with σ≈1.0-1.5
+    - Much better than 3-tap binomial filters (-0.87dB) used in basic implementations
+    """
+    def __init__(self, channels, filt_size=None, stride=(2,2), sigma=None):
         super().__init__()
         self.channels = channels
-        self.filt_size = filt_size
         self.stride_h, self.stride_w = stride if isinstance(stride, tuple) else (stride, stride)
-        self.padding = (filt_size - 1) // 2
-
-        if filt_size == 3:
-            a = torch.tensor([1., 2., 1.])
-        elif filt_size == 5:
-            a = torch.tensor([1., 4., 6., 4., 1.])
-        else:
-            a = torch.ones(filt_size)
         
-        filt_h = (a / a.sum()).view(1, 1, filt_size, 1).repeat(channels, 1, 1, 1) # (C,1,k,1)
-        filt_w = (a / a.sum()).view(1, 1, 1, filt_size).repeat(channels, 1, 1, 1) # (C,1,1,k)
+        # RESEARCH-BASED OPTIMIZATION: Auto-select filter size and sigma based on stride
+        max_stride = max(self.stride_h, self.stride_w)
+        
+        if filt_size is None:
+            # Auto-select optimal filter size based on downsampling factor
+            if max_stride >= 5:
+                self.filt_size = 11  # 11-tap for 5x+ downsampling (aggressive anti-aliasing)
+            elif max_stride >= 4:
+                self.filt_size = 9   # 9-tap for 4x downsampling  
+            elif max_stride >= 3:
+                self.filt_size = 7   # 7-tap for 3x downsampling
+            else:
+                self.filt_size = 5   # 5-tap for 2x downsampling
+        else:
+            self.filt_size = filt_size
+            
+        self.padding = (self.filt_size - 1) // 2
+        
+        # RESEARCH-BASED SIGMA OPTIMIZATION
+        if sigma is None:
+            # Optimized sigma values based on research for different downsampling factors
+            if max_stride >= 5:
+                self.sigma = 3.0    # σ=3.0 for 5x+ (strong low-pass filtering)
+            elif max_stride >= 4:
+                self.sigma = 2.5    # σ=2.5 for 4x 
+            elif max_stride >= 3:
+                self.sigma = 2.0    # σ=2.0 for 3x
+            else:
+                self.sigma = max(1.0, max_stride / 2.0)  # σ≈1.0-1.5 for 2x
+        else:
+            self.sigma = sigma
+        
+        # Generate 1D Gaussian kernel with optimized parameters
+        coords = torch.arange(self.filt_size, dtype=torch.float32)
+        coords -= (self.filt_size - 1) / 2.0
+        g = torch.exp(-(coords ** 2) / (2 * self.sigma ** 2))
+        g_norm = g / g.sum()
+        
+        # Create separable 2D filters
+        filt_h = g_norm.view(1, 1, self.filt_size, 1).repeat(channels, 1, 1, 1) # (C,1,k,1)
+        filt_w = g_norm.view(1, 1, 1, self.filt_size).repeat(channels, 1, 1, 1) # (C,1,1,k)
 
         self.register_buffer('filt_h', filt_h)
         self.register_buffer('filt_w', filt_w)
-
+        
+        # Debug info for optimization verification
+        print(f"      BlurPool2D: {max_stride}x stride → {self.filt_size}-tap filter, σ={self.sigma:.1f}")
+        
     def forward(self, x):
         # x shape: (Batch, Channels, Height, Width)
-        # Blur horizontally
+        # Apply separable Gaussian blur (horizontal then vertical)
         blurred_x = F.conv2d(x, self.filt_w, stride=1, padding=(0, self.padding), groups=self.channels)
-        # Blur vertically
         blurred_x = F.conv2d(blurred_x, self.filt_h, stride=1, padding=(self.padding, 0), groups=self.channels)
         # Downsample
         return blurred_x[:, :, ::self.stride_h, ::self.stride_w]
@@ -361,7 +432,7 @@ class PerShotTemporalEncoder(nn.Module):
             
             if t_pool > 1 or s_pool > 1:
                 # Using BlurPool2D for anti-aliased downsampling
-                cnn_layers.append(BlurPool2D(current_cnn_channels, filt_size=3, stride=(t_pool, s_pool)))
+                cnn_layers.append(BlurPool2D(current_cnn_channels, filt_size=None, stride=(t_pool, s_pool)))
                 
                 current_temp_dim = math.ceil(current_temp_dim / t_pool)
                 current_spatial_dim = math.ceil(current_spatial_dim / s_pool)
@@ -379,7 +450,7 @@ class PerShotTemporalEncoder(nn.Module):
             nn.Dropout(0.2),
             nn.Linear(embedding_dim * 2, embedding_dim)
         )
-
+        
         print(f"   Final CNN Output Channels: {final_feature_dim}")
         print(f"   Final Embedding Dim: {embedding_dim}")
         self.apply(initialize_seismic_weights) # Initialize weights
