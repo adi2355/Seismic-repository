@@ -54,7 +54,11 @@ class SincConv1d_SeismicAdapted(nn.Module):
         # Padding: 'same' will be handled by F.conv1d if padding arg is 'same'
         # Or calculate manually: self.padding_val = (kernel_size - 1) // 2
         if isinstance(padding, str) and padding.lower() == 'same':
-            self.padding_val = padding # Pass 'same' directly to F.conv1d
+            if stride == 1:
+                self.padding_val = padding # Pass 'same' directly to F.conv1d only for stride=1
+            else:
+                # For stride > 1, calculate manual padding since 'same' is not supported
+                self.padding_val = (kernel_size - 1) // 2
         elif isinstance(padding, int):
             self.padding_val = padding
         else: # Default to manual 'same' calculation

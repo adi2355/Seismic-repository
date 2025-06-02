@@ -1022,6 +1022,7 @@ def train_with_curriculum_fixed(experiment_name, model, train_loader, val_loader
     """Enhanced training function with proper curriculum learning and SoftAdapt handling."""
     print(f"\n--- Starting Fixed Curriculum Experiment: {experiment_name} ---")
     
+    history = {'train_loss': [], 'val_mape': []}
     best_val_mape = float('inf')
     checkpoint_dir = "checkpoints"
     if not os.path.exists(checkpoint_dir):
@@ -1077,6 +1078,9 @@ def train_with_curriculum_fixed(experiment_name, model, train_loader, val_loader
         epoch_train_loss = running_train_loss / len(train_loader.dataset)
         epoch_val_mape = running_val_mape / len(val_loader.dataset)
         
+        history['train_loss'].append(epoch_train_loss)
+        history['val_mape'].append(epoch_val_mape)
+        
         # Enhanced logging with curriculum and SoftAdapt info
         print_msg = f"Epoch {epoch+1}/{num_epochs} | Train Loss: {epoch_train_loss:.6f} | Val MAPE: {epoch_val_mape:.4f}%"
         
@@ -1105,7 +1109,7 @@ def train_with_curriculum_fixed(experiment_name, model, train_loader, val_loader
         print(print_msg)
     
     print(f"\nFinished {experiment_name}. Best Val MAPE: {best_val_mape:.4f}%")
-    return best_val_mape
+    return best_val_mape, history
 
 
 def run_phase2_experiments(BaselineUNet, SeismicDataset, train_loader, val_loader, calculate_mape, device, 

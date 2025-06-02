@@ -54,8 +54,32 @@ class Down(nn.Module):
     """Downscaling with MaxPool then DoubleConv"""
     def __init__(self, in_channels, out_channels, pool_kernel_stride=(2, 2)):
         super().__init__()
+        kernel_size_val = None
+        stride_val = None
+
+        # Interpret pool_kernel_stride for asymmetric pooling
+        if isinstance(pool_kernel_stride, tuple) and len(pool_kernel_stride) == 2 and \
+           isinstance(pool_kernel_stride[0], tuple) and isinstance(pool_kernel_stride[1], tuple):
+            # Format: ((Kernel_H, Kernel_W), (Stride_H, Stride_W))
+            kernel_size_val = pool_kernel_stride[0]
+            stride_val = pool_kernel_stride[1]
+        elif isinstance(pool_kernel_stride, tuple) and len(pool_kernel_stride) == 2 and \
+             all(isinstance(val, int) for val in pool_kernel_stride):
+            # Standard format for MaxPool2d: (kernel_size_val, stride_val)
+            # Or if stride is not specified, it defaults to kernel_size_val
+            kernel_size_val = pool_kernel_stride[0]
+            stride_val = pool_kernel_stride[1]
+        elif isinstance(pool_kernel_stride, int):
+            # Single integer: kernel_size_val = stride_val = value
+            kernel_size_val = pool_kernel_stride
+            stride_val = pool_kernel_stride
+        else:
+            # Default to (2,2) for both kernel and stride if format is unexpected
+            kernel_size_val = 2
+            stride_val = 2
+            
         self.maxpool_conv = nn.Sequential(
-            nn.MaxPool2d(pool_kernel_stride[0], stride=pool_kernel_stride[1]),
+            nn.MaxPool2d(kernel_size=kernel_size_val, stride=stride_val),
             DoubleConv(in_channels, out_channels)
         )
 
@@ -101,51 +125,49 @@ class OutConv(nn.Module):
 
 
 class BaselineUNet(nn.Module):
-    """
-    Complete BaselineUNet with proper encoder/decoder split for integration
-    """
     def __init__(self, n_channels_in, n_channels_out, bilinear=True):
         super(BaselineUNet, self).__init__()
         self.n_channels_in = n_channels_in
         self.n_channels_out = n_channels_out
         self.bilinear = bilinear
+        factor = 2 if bilinear else 1 
 
-        # Encoder - More conservative pooling for (5, 10001, 31) → (1, 300, 1259)
+        # Encoder (Using Asymmetric Pooling like your champion from the Colab Notebook)
         self.inc = DoubleConv(n_channels_in, 64)
-        self.down1 = Down(64, 128, pool_kernel_stride=(2, 2))    # Mild downsampling
-        self.down2 = Down(128, 256, pool_kernel_stride=(2, 2))   # Mild downsampling
-        self.down3 = Down(256, 512, pool_kernel_stride=(2, 2))   # Mild downsampling  
-        factor = 2 if bilinear else 1
-        self.down4 = Down(512, 1024 // factor, pool_kernel_stride=(2, 2))  # Final bottleneck
+        # These pooling/upsampling factors MUST match your champion BaselineUNet
+        # pool_kernel_stride=((Kernel_H, Kernel_W), (Stride_H, Stride_W)) for MaxPool2d
+        self.down1 = Down(64, 128,   pool_kernel_stride=((4,2), (4,1))) 
+        self.down2 = Down(128, 256,  pool_kernel_stride=((4,2), (4,1))) 
+        self.down3 = Down(256, 512,  pool_kernel_stride=((5,2), (5,1))) 
+        self.down4 = Down(512, 1024 // factor, pool_kernel_stride=((5,2), (5,1)))
 
-        # Decoder - symmetric upsampling with conservative scaling
-        self.up1 = Up(1024, 512 // factor, bilinear, upsample_scale_factor=(2, 2))
-        self.up2 = Up(512, 256 // factor, bilinear, upsample_scale_factor=(2, 2))
-        self.up3 = Up(256, 128 // factor, bilinear, upsample_scale_factor=(2, 2))
-        self.up4 = Up(128, 64, bilinear, upsample_scale_factor=(2, 2))
+        # Decoder (Using Asymmetric Upsampling to match)
+        # upsample_scale_factor=(Scale_H, Scale_W) for nn.Upsample
+        self.up1 = Up(1024, 512 // factor, bilinear, upsample_scale_factor=(5,1)) 
+        self.up2 = Up(512, 256 // factor, bilinear, upsample_scale_factor=(5,1))
+        self.up3 = Up(256, 128 // factor, bilinear, upsample_scale_factor=(4,1))
+        self.up4 = Up(128, 64, bilinear, upsample_scale_factor=(4,1))
         self.outc = OutConv(64, n_channels_out)
 
-    def forward(self, x):
-        """Standard forward pass"""
+    def forward(self, x): # Standard U-Net forward pass
         x1, x2, x3, x4, x5 = self.forward_encoder(x)
         return self.forward_decoder(x5, x4, x3, x2, x1)
 
-    def forward_encoder(self, x):
-        """Encoder forward pass - returns all skip connections and bottleneck"""
+    def forward_encoder(self, x): # Encoder pass returning skip connections
         x1 = self.inc(x)
         x2 = self.down1(x1)
         x3 = self.down2(x2)
         x4 = self.down3(x3)
-        x5 = self.down4(x4)  # Bottleneck features
+        x5 = self.down4(x4)
         return x1, x2, x3, x4, x5
 
-    def forward_decoder(self, x5, x4, x3, x2, x1):
-        """Decoder forward pass with skip connections"""
+    def forward_decoder(self, x5, x4, x3, x2, x1): # Decoder pass with skips
         x = self.up1(x5, x4)
         x = self.up2(x, x3)
         x = self.up3(x, x2)
         x = self.up4(x, x1)
         logits = self.outc(x)
+        # Final interpolation to target size (300, 1259)
         final_output = F.interpolate(logits, size=(300, 1259), mode='bilinear', align_corners=False)
         return final_output
 
