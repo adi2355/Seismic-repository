@@ -49,7 +49,7 @@ Kukreja, Navjot & Louboutin, Mathias & Lange, Michael & Luporini, Fabio & Gorman
 REMEMBER TO ADD YOUR PACKAGES TO the requirements.txt
 """
 
-pip install anytree
+# pip install anytree
 
 import numpy as np
 from anytree import Node, RenderTree
@@ -207,9 +207,9 @@ sketch_directory_tree()
 from google.colab import drive
 drive.mount('/content/drive')
 
-!cp -r /content/drive/MyDrive/speed-and-structure-train-data.zip /content/sample_data/
+# !cp -r /content/drive/MyDrive/speed-and-structure-train-data.zip /content/sample_data/
 
-!unzip /content/sample_data/speed-and-structure-train-data.zip -d /content/sample_data/dataset/
+# !unzip /content/sample_data/speed-and-structure-train-data.zip -d /content/sample_data/dataset/
 
 """
 Below, we begin by listing the sample IDs for the five samples included in the `train` folder. We then display the file names contained within the first sample directory.
@@ -705,7 +705,7 @@ if __name__ == '__main__': # Run only if script is executed directly
         import traceback
         traceback.print_exc()
 
-!pip install pytorch-msssim softadapt scikit-image
+#!pip install pytorch-msssim softadapt scikit-image
 
 # =============================================================================
 # PHASE 2 EXPERIMENTAL FRAMEWORK INTEGRATION
@@ -2121,45 +2121,70 @@ def run_stage2_finetune_sincgat_unet(
     curriculum_total_epochs_for_simple_phase=5,
     experiment_name_prefix="Stage2_Finetune"
 ):
-    print(f"--- Starting Stage 2: Fine-tuning CompleteSincGAT_UNet ---")
-    if not pretrained_unet_weights_path or not os.path.exists(pretrained_unet_weights_path):
-        print(f"ERROR: Pretrained U-Net weights path invalid or file not found: {pretrained_unet_weights_path}")
-        return None, (None, None) # Indicate failure
-
-    print(f"Using pretrained U-Net weights from: {pretrained_unet_weights_path}")
-
-    configure_a100_stability(disable_tf32=True) # UNCOMMENTED
-
-    train_loader, val_loader = setup_phase2_data_loaders(batch_size=batch_size) # FIXED UNPACKING
-
-    print("Instantiating CompleteSincGAT_UNet for Stage 2...")
-    # Corrected instantiation based on your analysis and CompleteSincGAT_UNet definition
+    """
+    Run the Stage 2 fine-tuning process for the SincGAT-UNet architecture:
+    
+    Phase A: Train only the frontend (SincNet + GAT) with U-Net frozen
+    Phase B: Fine-tune the entire model with different learning rates
+    
+    Args:
+        pretrained_unet_weights_path: Path to pretrained UNet weights from Stage 1
+        num_epochs_phase_a: Number of epochs for frontend training
+        num_epochs_phase_b: Number of epochs for full model fine-tuning
+        batch_size: Batch size for training
+        lr_frontend_phase_a: Learning rate for frontend in Phase A
+        lr_frontend_phase_b: Learning rate for frontend in Phase B
+        lr_unet_finetune_phase_b: Learning rate for U-Net in Phase B
+        weight_decay: Weight decay for AdamW optimizer
+        min_velocity: Minimum velocity value for loss calculation
+        logmae_initial_c: Initial C value for LogSpaceMAE
+        loss_fixed_weights: Weights for different loss components
+        curriculum_start_simple: Whether to start with simple loss and progress
+        curriculum_total_epochs_for_simple_phase: Number of epochs for simple phase
+        experiment_name_prefix: Prefix for experiment name
+    
+    Returns:
+        Dictionary containing training results and metrics
+    """
+    print("=" * 80)
+    print(f"🚀 STAGE 2: FINE-TUNING SINCGAT-UNET MODEL")
+    print("=" * 80)
+    
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
+    
+    # Setup data loaders
+    train_loader, val_loader = setup_phase2_data_loaders(
+        batch_size=batch_size, num_workers=0
+    )
+    
+    # Create the CompleteSincGAT_UNet model
     sincgat_model = CompleteSincGAT_UNet(
         sample_rate=10001,
         num_receivers=31,
         time_samples=10001,
-        num_shots=5, 
-        sinc_out_channels=60, 
-        sinc_kernel_size=1001, 
-        sinc_stride=1, 
-        sinc_min_low_hz=40, 
+        num_shots=5,
+        sinc_out_channels=60,
+        sinc_kernel_size=1001,
+        sinc_stride=1,
+        sinc_min_low_hz=40,
         sinc_max_learnable_hz=1000,
-        sinc_window_func='blackman', 
+        sinc_min_band_hz=10,
+        sinc_window_func='blackman',
         sinc_init_type='logarithmic',
-        shot_embedding_dim=128, 
-        gat_hidden_per_head=32, 
-        gat_num_heads=4,        
-        gat_layers=1,           
-        gat_dropout_feat=0.1,   
-        gat_dropout_attn=0.1,   
+        shot_embedding_dim=128,
+        gat_hidden_per_head=32,
+        gat_num_heads=4,
+        gat_layers=1,
+        gat_dropout_feat=0.3,
+        gat_dropout_attn=0.2,
         fused_embedding_dim=128,
         n_unet_output_channels=1,
         unet_bilinear=True,
-        unet_bottleneck_channels=512, 
-        fusion_ratio=0.25             
+        unet_bottleneck_channels=512,
+        fusion_ratio=0.25
     ).to(device)
-    print(f"CompleteSincGAT_UNet instantiated with {sum(p.numel() for p in sincgat_model.parameters())} parameters.")
-
+    
     try:
         print(f"Loading pretrained U-Net weights into sincgat_model.unet...")
         champion_unet_state_dict = torch.load(pretrained_unet_weights_path, map_location=device)
@@ -2407,7 +2432,7 @@ ax[-1].axis("off")
 plt.tight_layout()
 plt.show()
 
-!zip -r model_backup.zip "/content/checkpoints/Extended_Absolute_Champion_epoch_40.pth"
+#!zip -r model_backup.zip "/content/checkpoints/Extended_Absolute_Champion_epoch_40.pth"
 
 from google.colab import files
 
@@ -2570,3 +2595,742 @@ To highlight and encourage innovation in this challenge, we are offering **two h
 
 By strictly following these guidelines, you will help us evaluate your submission more effectively and increase the chances of your work being recognized. Non-compliance with these requirements may lead to your submission being rejected or not evaluated properly. <b>Thank you for your attention to details and good luck with the challenge!</b>
 """
+
+# === SYSTEMATIC EXPERIMENTAL FRAMEWORK FOR STAGE 2 HYPERPARAMETER EXPLORATION ===
+# This framework systematically explores the hyperparameter space for CompleteSincGAT_UNet
+# after Stage 1 (BaselineUNet pre-training) is complete.
+
+import itertools
+import json
+from datetime import datetime
+import pandas as pd
+
+print("\\n" + "="*40 + " EXPERIMENTAL FRAMEWORK SETUP " + "="*40)
+
+class Stage2ExperimentalFramework:
+    """
+    Systematic experimental framework for exploring CompleteSincGAT_UNet hyperparameters
+    in the transfer learning context (Stage 2 fine-tuning).
+    """
+    
+    def __init__(self, 
+                 pretrained_unet_weights_path,
+                 base_experiment_name="Stage2_Systematic",
+                 results_dir="experiment_results",
+                 device=None):
+        self.pretrained_unet_weights_path = pretrained_unet_weights_path
+        self.base_experiment_name = base_experiment_name
+        self.results_dir = results_dir
+        self.device = device if device else torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        
+        # Create results directory
+        if not os.path.exists(self.results_dir):
+            os.makedirs(self.results_dir)
+            
+        # Initialize results tracking
+        self.experiment_results = []
+        self.best_result = None
+        
+        print(f"🔬 Experimental Framework Initialized:")
+        print(f"   Pretrained U-Net: {self.pretrained_unet_weights_path}")
+        print(f"   Results Directory: {self.results_dir}")
+        print(f"   Device: {self.device}")
+    
+    def define_parameter_grids(self):
+        """Define parameter grids for systematic exploration."""
+        
+        # === PRIORITY 1: Learning Rate & Schedule Experiments ===
+        self.lr_schedule_grid = {
+            'lr_frontend_phase_b': [2e-5, 5e-5, 1e-4],
+            'lr_unet_finetune_phase_b': [5e-6, 1e-5, 2e-5],
+            'lr_scheduler_type': [None, 'ReduceLROnPlateau', 'CosineAnnealingLR'],
+            'scheduler_patience': [3, 5, 7],  # For ReduceLROnPlateau
+            'scheduler_factor': [0.1, 0.2, 0.5],  # For ReduceLROnPlateau
+        }
+        
+        # === PRIORITY 2: GAT Configuration Experiments ===
+        self.gat_config_grid = {
+            'gat_layers': [1, 2],
+            'gat_num_heads': [2, 4, 8],
+            'gat_hidden_per_head': [16, 32, 64],
+            'gat_dropout_feat': [0.1, 0.2, 0.3],
+            'gat_dropout_attn': [0.1, 0.2, 0.3],
+            'use_global_attention': [True, False],  # For readout pooling
+        }
+        
+        # === PRIORITY 3: GAT Context Injection Experiments ===
+        self.fusion_config_grid = {
+            'fusion_ratio': [0.1, 0.25, 0.5],
+            'fusion_method': ['concat_conv', 'film'],  # Future: FiLM implementation
+        }
+        
+        # === PRIORITY 4: Shot Embedding Dimension Experiments ===
+        # Note: This requires re-running Stage 2a (frontend training)
+        self.embedding_dim_grid = {
+            'shot_embedding_dim': [64, 128, 256],
+        }
+        
+        # === PRIORITY 5: Training Configuration Experiments ===
+        self.training_config_grid = {
+            'num_epochs_phase_a': [5, 10, 15],
+            'num_epochs_phase_b': [20, 30, 40],
+            'batch_size': [2, 4, 8],
+            'weight_decay': [0.001, 0.01, 0.1],
+            'curriculum_epochs': [0, 3, 5],
+        }
+        
+        print("✅ Parameter grids defined for systematic exploration")
+    
+    def create_experiment_config(self, **param_overrides):
+        """Create a complete experiment configuration with parameter overrides."""
+        
+        # Base configuration (your current working setup)
+        base_config = {
+            # Model architecture
+            'sample_rate': 10001,
+            'num_receivers': 31,
+            'time_samples': 10001,
+            'num_shots': 5,
+            'sinc_out_channels': 60,
+            'sinc_kernel_size': 1001,
+            'sinc_stride': 1,
+            'sinc_min_low_hz': 40,
+            'sinc_max_learnable_hz': 1000,
+            'sinc_min_band_hz': 10,
+            'sinc_window_func': 'blackman',
+            'sinc_init_type': 'logarithmic',
+            'shot_embedding_dim': 128,
+            'gat_hidden_per_head': 32,
+            'gat_num_heads': 4,
+            'gat_layers': 1,
+            'gat_dropout_feat': 0.3,
+            'gat_dropout_attn': 0.2,
+            'fused_embedding_dim': 128,
+            'n_unet_output_channels': 1,
+            'unet_bilinear': True,
+            'unet_bottleneck_channels': 512,
+            'fusion_ratio': 0.25,
+            
+            # Training parameters
+            'batch_size': 4,
+            'num_epochs_phase_a': 10,
+            'num_epochs_phase_b': 30,
+            'lr_frontend_phase_a': 1e-4,
+            'lr_frontend_phase_b': 5e-5,
+            'lr_unet_finetune_phase_b': 1e-5,
+            'weight_decay': 0.01,
+            
+            # Loss parameters
+            'min_velocity': 1.5,
+            'logmae_initial_c': 0.1,
+            'loss_fixed_weights': [1.0, 0.12, 0.007],
+            'curriculum_start_simple': True,
+            'curriculum_total_epochs_for_simple_phase': 5,
+            
+            # Scheduler parameters
+            'lr_scheduler_type': None,  # None, 'ReduceLROnPlateau', 'CosineAnnealingLR'
+            'scheduler_factor': 0.5,
+            'scheduler_patience': 5
+        }
+        
+        # Update with any parameter overrides
+        for key, value in param_overrides.items():
+            base_config[key] = value
+        
+        return base_config
+    
+    def run_single_experiment(self, config, experiment_id):
+        """
+        Run a single experiment with the given configuration and record results.
+        """
+        experiment_name = f"{self.base_experiment_name}_{experiment_id}"
+        start_time = datetime.now()
+        
+        print(f"\n🧪 Running Experiment {experiment_id}: {experiment_name}")
+        print(f"   Key parameters: {self._format_key_params(config)}")
+        print("=" * 60)
+        
+        # Configure A100 stability
+        configure_a100_stability(disable_tf32=True)
+        
+        try:
+            # Setup data loaders
+            print(f"Setting up data loaders with {config['batch_size']} batch size...")
+            train_loader, val_loader = setup_phase2_data_loaders(batch_size=config['batch_size'])
+            
+            # Create model
+            sincgat_model = CompleteSincGAT_UNet(
+                sample_rate=config['sample_rate'],
+                num_receivers=config['num_receivers'],
+                time_samples=config['time_samples'],
+                num_shots=config['num_shots'],
+                sinc_out_channels=config['sinc_out_channels'],
+                sinc_kernel_size=config['sinc_kernel_size'],
+                sinc_stride=config['sinc_stride'],
+                sinc_min_low_hz=config['sinc_min_low_hz'],
+                sinc_max_learnable_hz=config['sinc_max_learnable_hz'],
+                sinc_min_band_hz=config['sinc_min_band_hz'],
+                sinc_window_func=config['sinc_window_func'],
+                sinc_init_type=config['sinc_init_type'],
+                shot_embedding_dim=config['shot_embedding_dim'],
+                gat_hidden_per_head=config['gat_hidden_per_head'],
+                gat_num_heads=config['gat_num_heads'],
+                gat_layers=config['gat_layers'],
+                gat_dropout_feat=config['gat_dropout_feat'],
+                gat_dropout_attn=config['gat_dropout_attn'],
+                fused_embedding_dim=config['fused_embedding_dim'],
+                n_unet_output_channels=config['n_unet_output_channels'],
+                unet_bilinear=config['unet_bilinear'],
+                unet_bottleneck_channels=config['unet_bottleneck_channels'],
+                fusion_ratio=config['fusion_ratio']
+            ).to(self.device)
+            
+            # Load pretrained U-Net weights
+            champion_unet_state_dict = torch.load(self.pretrained_unet_weights_path, map_location=self.device)
+            sincgat_model.unet.load_state_dict(champion_unet_state_dict, strict=True)
+            
+            # Setup loss function
+            criterion = RefinedLogSpaceMAEHybridLoss(
+                min_velocity=config['min_velocity'],
+                use_adaptive_softadapt=False,
+                logmae_momentum=0,
+                initial_c_logmae=config['logmae_initial_c'],
+                fixed_weights_list=config['loss_fixed_weights'],
+                start_simple=config['curriculum_start_simple'],
+                curriculum_epochs=config['curriculum_total_epochs_for_simple_phase']
+            ).to(self.device)
+            criterion.seismic_ms_ssim = StabilizedSeismicMSSSIM(
+                apply_log=True, data_range_log=2.0, c_for_log=0.1
+            ).to(self.device)
+            
+            # === Phase 2a: Frontend Training (U-Net Frozen) ===
+            print(f"   Phase 2a: Training frontend ({config['num_epochs_phase_a']} epochs)...")
+            
+            # Freeze U-Net
+            for param in sincgat_model.unet.parameters():
+                param.requires_grad = False
+            
+            # Setup optimizer for frontend only
+            frontend_params = [p for name, p in sincgat_model.named_parameters() 
+                             if 'unet' not in name and p.requires_grad]
+            optimizer_2a = torch.optim.AdamW(frontend_params, 
+                                           lr=config['lr_frontend_phase_a'], 
+                                           weight_decay=config['weight_decay'])
+            
+            # Setup scheduler if specified
+            scheduler_2a = self._create_scheduler(optimizer_2a, config, phase='2a')
+            
+            # Train Phase 2a
+            best_mape_2a, history_2a = train_with_curriculum_fixed(
+                experiment_name=f"{experiment_name}_PhaseA",
+                model=sincgat_model,
+                train_loader=train_loader,
+                val_loader=val_loader,
+                criterion=criterion,
+                optimizer=optimizer_2a,
+                num_epochs=config['num_epochs_phase_a'],
+                device=self.device,
+                calculate_mape_func=calculate_mape
+            )
+            
+            # === Phase 2b: Full Model Fine-tuning ===
+            print(f"   Phase 2b: Full model fine-tuning ({config['num_epochs_phase_b']} epochs)...")
+            
+            # Unfreeze U-Net
+            for param in sincgat_model.unet.parameters():
+                param.requires_grad = True
+            
+            # Setup differential learning rates
+            frontend_params = [p for name, p in sincgat_model.named_parameters() 
+                             if 'unet' not in name and p.requires_grad]
+            unet_params = [p for name, p in sincgat_model.named_parameters() 
+                          if 'unet' in name and p.requires_grad]
+            
+            optimizer_2b = torch.optim.AdamW([
+                {'params': frontend_params, 'lr': config['lr_frontend_phase_b']},
+                {'params': unet_params, 'lr': config['lr_unet_finetune_phase_b']}
+            ], weight_decay=config['weight_decay'])
+            
+            # Setup scheduler if specified
+            scheduler_2b = self._create_scheduler(optimizer_2b, config, phase='2b')
+            
+            # Train Phase 2b
+            best_mape_2b, history_2b = train_with_curriculum_fixed(
+                experiment_name=f"{experiment_name}_PhaseB",
+                model=sincgat_model,
+                train_loader=train_loader,
+                val_loader=val_loader,
+                criterion=criterion,
+                optimizer=optimizer_2b,
+                num_epochs=config['num_epochs_phase_b'],
+                device=self.device,
+                calculate_mape_func=calculate_mape
+            )
+            
+            # Record results
+            end_time = datetime.now()
+            duration = (end_time - start_time).total_seconds()
+            
+            result = {
+                'experiment_id': experiment_id,
+                'experiment_name': experiment_name,
+                'config': config,
+                'best_mape_phase_a': best_mape_2a,
+                'best_mape_phase_b': best_mape_2b,
+                'final_mape': best_mape_2b,  # Phase B is the final result
+                'history_phase_a': history_2a,
+                'history_phase_b': history_2b,
+                'duration_seconds': duration,
+                'timestamp': start_time.isoformat(),
+                'status': 'completed'
+            }
+            
+            print(f"   ✅ Experiment {experiment_id} completed!")
+            print(f"      Phase A MAPE: {best_mape_2a:.4f}%")
+            print(f"      Phase B MAPE: {best_mape_2b:.4f}%")
+            print(f"      Duration: {duration:.1f}s")
+            
+        except Exception as e:
+            print(f"   ❌ Experiment {experiment_id} failed: {str(e)}")
+            result = {
+                'experiment_id': experiment_id,
+                'experiment_name': experiment_name,
+                'config': config,
+                'error': str(e),
+                'status': 'failed',
+                'timestamp': start_time.isoformat()
+            }
+        
+        # Save result
+        self.experiment_results.append(result)
+        self._save_results()
+        
+        # Update best result
+        if result.get('status') == 'completed':
+            if self.best_result is None or result['final_mape'] < self.best_result['final_mape']:
+                self.best_result = result
+                print(f"   🏆 NEW BEST RESULT! MAPE: {result['final_mape']:.4f}%")
+        
+        return result
+    
+    def _create_scheduler(self, optimizer, config, phase):
+        """Create learning rate scheduler based on configuration."""
+        scheduler_type = config.get('lr_scheduler_type')
+        
+        if scheduler_type == 'ReduceLROnPlateau':
+            return torch.optim.lr_scheduler.ReduceLROnPlateau(
+                optimizer, 
+                mode='min',
+                factor=config['scheduler_factor'],
+                patience=config['scheduler_patience'],
+                verbose=True
+            )
+        elif scheduler_type == 'CosineAnnealingLR':
+            T_max = config['num_epochs_phase_a'] if phase == '2a' else config['num_epochs_phase_b']
+            return torch.optim.lr_scheduler.CosineAnnealingLR(
+                optimizer,
+                T_max=T_max,
+                eta_min=1e-7
+            )
+        else:
+            return None
+    
+    def _format_key_params(self, config):
+        """Format key parameters for display."""
+        key_params = {
+            'lr_frontend_b': config['lr_frontend_phase_b'],
+            'lr_unet_b': config['lr_unet_finetune_phase_b'],
+            'gat_heads': config['gat_num_heads'],
+            'gat_layers': config['gat_layers'],
+            'fusion_ratio': config['fusion_ratio'],
+            'batch_size': config['batch_size']
+        }
+        return str(key_params)
+    
+    def _save_results(self):
+        """Save experiment results to JSON file."""
+        results_file = os.path.join(self.results_dir, f"{self.base_experiment_name}_results.json")
+        
+        # Convert results to JSON-serializable format
+        serializable_results = []
+        for result in self.experiment_results:
+            serializable_result = result.copy()
+            # Convert any numpy arrays or tensors to lists
+            if 'history_phase_a' in serializable_result:
+                serializable_result['history_phase_a'] = self._serialize_history(serializable_result['history_phase_a'])
+            if 'history_phase_b' in serializable_result:
+                serializable_result['history_phase_b'] = self._serialize_history(serializable_result['history_phase_b'])
+            serializable_results.append(serializable_result)
+        
+        with open(results_file, 'w') as f:
+            json.dump(serializable_results, f, indent=2)
+        
+        print(f"📊 Results saved to: {results_file}")
+    
+    def _serialize_history(self, history):
+        """Convert history to JSON-serializable format."""
+        if history is None:
+            return None
+        
+        serializable_history = {}
+        for key, value in history.items():
+            if isinstance(value, (list, tuple)):
+                serializable_history[key] = [float(v) if hasattr(v, 'item') else v for v in value]
+            else:
+                serializable_history[key] = value
+        return serializable_history
+    
+    def run_lr_schedule_experiments(self, max_experiments=10):
+        """Run systematic learning rate and scheduler experiments."""
+        print(f"\\n🎯 Running Learning Rate & Schedule Experiments (max {max_experiments})...")
+        
+        # Create parameter combinations
+        lr_combinations = list(itertools.product(
+            self.lr_schedule_grid['lr_frontend_phase_b'],
+            self.lr_schedule_grid['lr_unet_finetune_phase_b'],
+            self.lr_schedule_grid['lr_scheduler_type']
+        ))
+        
+        # Limit to max_experiments
+        lr_combinations = lr_combinations[:max_experiments]
+        
+        experiment_id = len(self.experiment_results) + 1
+        
+        for lr_frontend_b, lr_unet_b, scheduler_type in lr_combinations:
+            config_overrides = {
+                'lr_frontend_phase_b': lr_frontend_b,
+                'lr_unet_finetune_phase_b': lr_unet_b,
+                'lr_scheduler_type': scheduler_type,
+            }
+            
+            # Add scheduler-specific parameters
+            if scheduler_type == 'ReduceLROnPlateau':
+                config_overrides.update({
+                    'scheduler_patience': 5,
+                    'scheduler_factor': 0.2
+                })
+            
+            config = self.create_experiment_config(**config_overrides)
+            self.run_single_experiment(config, experiment_id)
+            experiment_id += 1
+    
+    def run_gat_config_experiments(self, max_experiments=15):
+        """Run systematic GAT configuration experiments."""
+        print(f"\\n🎯 Running GAT Configuration Experiments (max {max_experiments})...")
+        
+        # Create parameter combinations
+        gat_combinations = list(itertools.product(
+            self.gat_config_grid['gat_layers'],
+            self.gat_config_grid['gat_num_heads'],
+            self.gat_config_grid['gat_hidden_per_head']
+        ))
+        
+        # Limit to max_experiments
+        gat_combinations = gat_combinations[:max_experiments]
+        
+        experiment_id = len(self.experiment_results) + 1
+        
+        for gat_layers, gat_heads, gat_hidden in gat_combinations:
+            config_overrides = {
+                'gat_layers': gat_layers,
+                'gat_num_heads': gat_heads,
+                'gat_hidden_per_head': gat_hidden,
+                'fused_embedding_dim': gat_heads * gat_hidden,  # Adjust output dimension
+            }
+            
+            config = self.create_experiment_config(**config_overrides)
+            self.run_single_experiment(config, experiment_id)
+            experiment_id += 1
+    
+    def run_fusion_experiments(self, max_experiments=6):
+        """Run GAT context injection experiments."""
+        print(f"\\n🎯 Running Fusion Configuration Experiments (max {max_experiments})...")
+        
+        fusion_ratios = self.fusion_config_grid['fusion_ratio'][:max_experiments]
+        experiment_id = len(self.experiment_results) + 1
+        
+        for fusion_ratio in fusion_ratios:
+            config_overrides = {
+                'fusion_ratio': fusion_ratio,
+            }
+            
+            config = self.create_experiment_config(**config_overrides)
+            self.run_single_experiment(config, experiment_id)
+            experiment_id += 1
+    
+    def generate_summary_report(self):
+        """Generate a comprehensive summary report of all experiments."""
+        if not self.experiment_results:
+            print("No experiment results to summarize.")
+            return
+        
+        print(f"\\n📈 EXPERIMENTAL SUMMARY REPORT")
+        print("="*60)
+        
+        # Filter successful experiments
+        successful_experiments = [r for r in self.experiment_results if r.get('status') == 'completed']
+        failed_experiments = [r for r in self.experiment_results if r.get('status') == 'failed']
+        
+        print(f"Total Experiments: {len(self.experiment_results)}")
+        print(f"Successful: {len(successful_experiments)}")
+        print(f"Failed: {len(failed_experiments)}")
+        
+        if successful_experiments:
+            # Sort by final MAPE
+            successful_experiments.sort(key=lambda x: x['final_mape'])
+            
+            print(f"\\n🏆 TOP 5 BEST RESULTS:")
+            for i, result in enumerate(successful_experiments[:5]):
+                print(f"  {i+1}. Exp {result['experiment_id']:03d}: {result['final_mape']:.4f}% MAPE")
+                print(f"     Key params: {self._format_key_params(result['config'])}")
+            
+            # Best result details
+            best = successful_experiments[0]
+            print(f"\\n🥇 BEST CONFIGURATION (Exp {best['experiment_id']:03d}):")
+            print(f"   Final MAPE: {best['final_mape']:.4f}%")
+            print(f"   Phase A MAPE: {best['best_mape_phase_a']:.4f}%")
+            print(f"   Phase B MAPE: {best['best_mape_phase_b']:.4f}%")
+            print(f"   Duration: {best['duration_seconds']:.1f}s")
+            
+            # Key parameters of best config
+            best_config = best['config']
+            print(f"\\n   🔧 Best Configuration Parameters:")
+            print(f"      Learning Rates: frontend_b={best_config['lr_frontend_phase_b']}, unet_b={best_config['lr_unet_finetune_phase_b']}")
+            print(f"      GAT: layers={best_config['gat_layers']}, heads={best_config['gat_num_heads']}, hidden_per_head={best_config['gat_hidden_per_head']}")
+            print(f"      Fusion: ratio={best_config['fusion_ratio']}")
+            print(f"      Training: batch_size={best_config['batch_size']}, weight_decay={best_config['weight_decay']}")
+            print(f"      Scheduler: {best_config['lr_scheduler_type']}")
+        
+        # Save summary to file
+        summary_file = os.path.join(self.results_dir, f"{self.base_experiment_name}_summary.txt")
+        with open(summary_file, 'w') as f:
+            f.write(f"Experimental Summary Report\\n")
+            f.write(f"Generated: {datetime.now().isoformat()}\\n")
+            f.write(f"Total Experiments: {len(self.experiment_results)}\\n")
+            f.write(f"Successful: {len(successful_experiments)}\\n")
+            f.write(f"Failed: {len(failed_experiments)}\\n\\n")
+            
+            if successful_experiments:
+                f.write(f"Best Result: {successful_experiments[0]['final_mape']:.4f}% MAPE\\n")
+                f.write(f"Best Config: {self._format_key_params(successful_experiments[0]['config'])}\\n")
+        
+        print(f"\\n📄 Summary saved to: {summary_file}")
+
+# === ORCHESTRATION FUNCTIONS ===
+
+def run_systematic_stage2_experiments(pretrained_unet_weights_path, 
+                                     experiment_type="lr_schedule",
+                                     max_experiments=10):
+    """
+    Orchestrate systematic Stage 2 experiments.
+    
+    Args:
+        pretrained_unet_weights_path: Path to Stage 1 pretrained U-Net weights
+        experiment_type: Type of experiments to run ('lr_schedule', 'gat_config', 'fusion', 'all')
+        max_experiments: Maximum number of experiments to run
+    """
+    
+    if not os.path.exists(pretrained_unet_weights_path):
+        print(f"❌ ERROR: Pretrained U-Net weights not found at: {pretrained_unet_weights_path}")
+        print("   Please run Stage 1 pre-training first.")
+        return None
+    
+    # Initialize experimental framework
+    framework = Stage2ExperimentalFramework(
+        pretrained_unet_weights_path=pretrained_unet_weights_path,
+        base_experiment_name=f"Stage2_Systematic_{experiment_type}",
+        device=device
+    )
+    
+    # Define parameter grids
+    framework.define_parameter_grids()
+    
+    # Run experiments based on type
+    if experiment_type == "lr_schedule":
+        framework.run_lr_schedule_experiments(max_experiments=max_experiments)
+    elif experiment_type == "gat_config":
+        framework.run_gat_config_experiments(max_experiments=max_experiments)
+    elif experiment_type == "fusion":
+        framework.run_fusion_experiments(max_experiments=max_experiments)
+    elif experiment_type == "all":
+        # Run a subset of each type
+        framework.run_lr_schedule_experiments(max_experiments=max_experiments//3)
+        framework.run_gat_config_experiments(max_experiments=max_experiments//3)
+        framework.run_fusion_experiments(max_experiments=max_experiments//3)
+    else:
+        print(f"❌ Unknown experiment type: {experiment_type}")
+        return None
+    
+    # Generate summary report
+    framework.generate_summary_report()
+    
+    return framework
+
+def quick_stage2_experiment_demo(pretrained_unet_weights_path):
+    """
+    Run a quick demonstration of the experimental framework with 3 experiments.
+    """
+    print("\\n🚀 Running Quick Stage 2 Experiment Demo...")
+    
+    framework = run_systematic_stage2_experiments(
+        pretrained_unet_weights_path=pretrained_unet_weights_path,
+        experiment_type="lr_schedule",
+        max_experiments=3
+    )
+    
+    if framework and framework.best_result:
+        print(f"\\n✅ Demo completed! Best MAPE: {framework.best_result['final_mape']:.4f}%")
+        return framework.best_result
+    else:
+        print("\\n❌ Demo failed or no successful experiments.")
+        return None
+
+print("✅ Systematic Experimental Framework for Stage 2 ready!")
+print("\\n📋 Available functions:")
+print("   - run_systematic_stage2_experiments(pretrained_path, experiment_type, max_experiments)")
+print("   - quick_stage2_experiment_demo(pretrained_path)")
+print("\\n🎯 Experiment types: 'lr_schedule', 'gat_config', 'fusion', 'all'")
+
+# === END OF EXPERIMENTAL FRAMEWORK ===
+
+# === COMPLETE ORCHESTRATION EXAMPLE ===
+# This shows the complete workflow: Stage 1 → Stage 2 → Systematic Experiments
+
+def run_complete_two_stage_workflow_with_experiments(
+    stage1_epochs=45,
+    stage1_batch_size=8,
+    experiment_type="lr_schedule",
+    max_stage2_experiments=10
+):
+    """
+    Complete workflow: Stage 1 pre-training → Stage 2 systematic experiments
+    
+    Args:
+        stage1_epochs: Epochs for Stage 1 BaselineUNet pre-training
+        stage1_batch_size: Batch size for Stage 1
+        experiment_type: Type of Stage 2 experiments ('lr_schedule', 'gat_config', 'fusion', 'all')
+        max_stage2_experiments: Maximum number of Stage 2 experiments to run
+    """
+    
+    print("🚀 STARTING COMPLETE TWO-STAGE WORKFLOW WITH SYSTEMATIC EXPERIMENTS")
+    print("="*80)
+    
+    # === STAGE 1: Pre-train BaselineUNet ===
+    print("🔥 STAGE 1: PRE-TRAINING BASELINE U-NET")
+    print("-" * 50)
+    
+    stage1_weights_path, stage1_history = run_stage1_pretrain_unet(
+        num_epochs=stage1_epochs,
+        batch_size=stage1_batch_size,
+        lr=1e-4,
+        weight_decay=0.01,
+        experiment_name_prefix="Stage1_FullRun"
+    )
+    
+    if stage1_weights_path is None:
+        print("❌ Stage 1 failed. Cannot proceed to Stage 2.")
+        return None
+        
+    print(f"✅ Stage 1 completed! Pretrained weights saved at:")
+    print(f"   {stage1_weights_path}")
+    
+    # === STAGE 2: Systematic Experiments ===
+    print(f"\n🧪 STAGE 2: SYSTEMATIC EXPERIMENTS ({experiment_type.upper()})")
+    print("-" * 50)
+    
+    experimental_framework = run_systematic_stage2_experiments(
+        pretrained_unet_weights_path=stage1_weights_path,  # ← THIS IS WHERE THE PATH GOES
+        experiment_type=experiment_type,
+        max_experiments=max_stage2_experiments
+    )
+    
+    if experimental_framework and experimental_framework.best_result:
+        print(f"\n🏆 BEST RESULT FROM SYSTEMATIC EXPERIMENTS:")
+        print(f"   Final MAPE: {experimental_framework.best_result['final_mape']:.4f}%")
+        print(f"   Experiment ID: {experimental_framework.best_result['experiment_id']}")
+        
+        return {
+            'stage1_weights_path': stage1_weights_path,
+            'stage1_history': stage1_history,
+            'best_stage2_result': experimental_framework.best_result,
+            'experimental_framework': experimental_framework
+        }
+    else:
+        print("❌ Stage 2 experiments failed.")
+        return None
+
+# === QUICK EXAMPLES FOR IMMEDIATE USE ===
+
+def quick_lr_experiments():
+    """Run a quick learning rate experiment (small scale for testing)"""
+    return run_complete_two_stage_workflow_with_experiments(
+        stage1_epochs=5,  # Quick for testing
+        stage1_batch_size=8,
+        experiment_type="lr_schedule",
+        max_stage2_experiments=3
+    )
+
+def full_lr_experiments():
+    """Run full learning rate experiments"""
+    return run_complete_two_stage_workflow_with_experiments(
+        stage1_epochs=45,  # Full training
+        stage1_batch_size=8,
+        experiment_type="lr_schedule",
+        max_stage2_experiments=10
+    )
+
+def full_gat_experiments():
+    """Run full GAT configuration experiments"""
+    return run_complete_two_stage_workflow_with_experiments(
+        stage1_epochs=45,
+        stage1_batch_size=8,
+        experiment_type="gat_config",
+        max_stage2_experiments=15
+    )
+
+# === IF YOU ALREADY HAVE STAGE 1 WEIGHTS ===
+
+def run_experiments_with_existing_weights(pretrained_weights_path):
+    """
+    Use this if you already have Stage 1 pretrained weights
+    
+    Args:
+        pretrained_weights_path: Path to your existing Stage 1 .pth file
+                               e.g., "checkpoints/Stage1_FullRun_UNet_Asymmetric_best_mape.pth"
+    """
+    
+    if not os.path.exists(pretrained_weights_path):
+        print(f"❌ ERROR: Pretrained weights not found at: {pretrained_weights_path}")
+        print("Available checkpoint files:")
+        if os.path.exists("checkpoints"):
+            for f in os.listdir("checkpoints"):
+                if f.endswith('.pth'):
+                    print(f"   checkpoints/{f}")
+        return None
+    
+    print(f"🔥 Using existing pretrained weights: {pretrained_weights_path}")
+    
+    # Run systematic experiments
+    framework = run_systematic_stage2_experiments(
+        pretrained_unet_weights_path=pretrained_weights_path,  # ← THIS IS WHERE YOUR PATH GOES
+        experiment_type="lr_schedule",  # Change this as needed
+        max_experiments=10
+    )
+    
+    return framework
+
+print("\n" + "="*60)
+print("🎯 READY TO RUN COMPLETE WORKFLOW!")
+print("="*60)
+print("📋 Choose your approach:")
+print("   METHOD 1 - Complete workflow (Stage 1 → Stage 2):")
+print("     • quick_lr_experiments()          # Quick test (5 epochs)")
+print("     • full_lr_experiments()           # Full LR experiments")
+print("     • full_gat_experiments()          # Full GAT experiments")
+print()
+print("   METHOD 2 - Use existing Stage 1 weights:")
+print("     • run_experiments_with_existing_weights('path/to/weights.pth')")
+print()
+print("   METHOD 3 - Manual control:")
+print("     • run_systematic_stage2_experiments(pretrained_path, experiment_type, max_experiments)")
+print("="*60)
