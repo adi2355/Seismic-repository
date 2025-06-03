@@ -1362,7 +1362,65 @@ print("✅ All required functions loaded successfully")
 print("🔧 Setting up fallback functions for missing dependencies...")
 
 # Fallback data loader function
+def setup_phase2_data_loaders(batch_size=8, num_workers=0, test_size=0.2, random_state=42):
+    """
+    Fallback data loader function.
+    This is a placeholder - you should import the real function from your data file.
+    """
+    print(f"⚠️ Using fallback data loader function")
+    print(f"   Please import setup_phase2_data_loaders from your data file")
+    print(f"   For now, creating dummy loaders for validation...")
+    
+    # Create minimal dummy datasets for validation
+    import torch.utils.data as data
+    
+    class DummyDataset(data.Dataset):
+        def __init__(self, size=32):
+            self.size = size
+        
+        def __len__(self):
+            return self.size
+        
+        def __getitem__(self, idx):
+            # Return dummy data matching expected shapes
+            shots = torch.randn(5, 10001, 31)  # 5 shots, 10001 time samples, 31 receivers
+            velocity = torch.randn(1, 300, 1259)  # Target velocity field - FIXED: Added channel dimension [1, H, W]
+            return shots, velocity
+    
+    train_dataset = DummyDataset(64)  # Small dataset for validation
+    val_dataset = DummyDataset(32)
+    
+    train_loader = data.DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers)
+    val_loader = data.DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers)
+    
+    print(f"✅ Dummy data loaders created for validation")
+    print(f"   Training: {len(train_loader)} batches, Validation: {len(val_loader)} batches")
+    
+    return train_loader, val_loader
 
+# Fallback MAPE calculation function
+def calculate_mape(pred, target, min_velocity=1.5, epsilon=1e-8):
+    """
+    Fallback MAPE calculation function.
+    """
+    # Convert to torch tensors if numpy arrays
+    if isinstance(pred, np.ndarray):
+        pred = torch.from_numpy(pred)
+    if isinstance(target, np.ndarray):
+        target = torch.from_numpy(target)
+    
+    # Handle shape mismatches - squeeze channel dimension if needed
+    if pred.dim() == 4 and pred.shape[1] == 1:  # [B, 1, H, W]
+        pred = pred.squeeze(1)  # [B, H, W]
+    if target.dim() == 4 and target.shape[1] == 1:  # [B, 1, H, W]
+        target = target.squeeze(1)  # [B, H, W]
+    
+    pred_clamped = torch.clamp(pred, min=min_velocity)
+    target_clamped = torch.clamp(target, min=min_velocity)
+    
+    percentage_errors = torch.abs((target_clamped - pred_clamped) / (target_clamped + epsilon)) * 100
+    mape = torch.mean(percentage_errors)
+    return mape.item()
 
 # Fallback training function
 def train_validate_model_with_checkpoints(experiment_name, model, train_loader, val_loader, 
@@ -1457,8 +1515,6 @@ def train_validate_model_with_checkpoints(experiment_name, model, train_loader, 
     return best_val_mape, history
 
 print("✅ Fallback functions ready")
-
-print("\\n" + "="*30 + " TWO-STAGE TRAINING SETUP " + "="*30)
 
 # === CRITICAL: GLOBAL DEFINITIONS ===
 # Ensure CHECKPOINT_DIR is defined globally to prevent NameError
@@ -1794,8 +1850,8 @@ def run_stage2_finetune_sincgat_unet(
     if unet_params:
         param_groups.append({
             'params': unet_params, 
-            'lr': config['lr_unet_finetune_phase_b'],
-            'weight_decay': config['weight_decay']
+            'lr': lr_unet_finetune_phase_b,
+            'weight_decay': weight_decay
         })
         print(f"   📊 U-Net params: {len(unet_params)}")
     
@@ -1803,8 +1859,8 @@ def run_stage2_finetune_sincgat_unet(
     if other_frontend_params:
         param_groups.append({
             'params': other_frontend_params, 
-            'lr': config['lr_frontend_phase_b'],
-            'weight_decay': config['weight_decay']
+            'lr': lr_frontend_phase_b,
+            'weight_decay': weight_decay
         })
         print(f"   📊 Other frontend params: {len(other_frontend_params)}")
     
@@ -1812,8 +1868,8 @@ def run_stage2_finetune_sincgat_unet(
     if gat_context_norm_params:
         param_groups.append({
             'params': gat_context_norm_params, 
-            'lr': config.get('lr_film_generator', config['lr_frontend_phase_b']),
-            'weight_decay': config.get('weight_decay_film', config['weight_decay'])
+            'lr': lr_frontend_phase_b,  # Use frontend LR as fallback
+            'weight_decay': weight_decay
         })
         print(f"   📊 GAT Context LayerNorm params: {len(gat_context_norm_params)}")
     
@@ -1821,8 +1877,8 @@ def run_stage2_finetune_sincgat_unet(
     if film_generator_params:
         param_groups.append({
             'params': film_generator_params, 
-            'lr': config.get('lr_film_generator', config['lr_frontend_phase_b']),
-            'weight_decay': config.get('weight_decay_film', config['weight_decay'])
+            'lr': lr_frontend_phase_b,  # Use frontend LR as fallback
+            'weight_decay': weight_decay
         })
         print(f"   📊 FiLM generator params: {len(film_generator_params)}")
     
@@ -4728,5 +4784,28 @@ def run_corrected_film_validation():
             
             
 run_corrected_film_validation()
+
+def calculate_mape(pred, target, min_velocity=1.5, epsilon=1e-8):
+    """
+    Fallback MAPE calculation function.
+    """
+    # Convert to torch tensors if numpy arrays
+    if isinstance(pred, np.ndarray):
+        pred = torch.from_numpy(pred)
+    if isinstance(target, np.ndarray):
+        target = torch.from_numpy(target)
+    
+    # Handle shape mismatches - squeeze channel dimension if needed
+    if pred.dim() == 4 and pred.shape[1] == 1:  # [B, 1, H, W]
+        pred = pred.squeeze(1)  # [B, H, W]
+    if target.dim() == 4 and target.shape[1] == 1:  # [B, 1, H, W]
+        target = target.squeeze(1)  # [B, H, W]
+    
+    pred_clamped = torch.clamp(pred, min=min_velocity)
+    target_clamped = torch.clamp(target, min=min_velocity)
+    
+    percentage_errors = torch.abs((target_clamped - pred_clamped) / (target_clamped + epsilon)) * 100
+    mape = torch.mean(percentage_errors)
+    return mape.item()
 
 
