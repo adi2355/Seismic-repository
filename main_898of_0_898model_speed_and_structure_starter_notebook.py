@@ -2118,7 +2118,7 @@ def run_stage2_finetune_sincgat_unet(
     logmae_initial_c=0.1,
     loss_fixed_weights=[1.0, 0.12, 0.007],
     curriculum_start_simple=True,
-    curriculum_total_epochs_for_simple_phase=5,
+    curriculum_total_epochs_for_simple_phase=2,  # Changed from 5 to 2: Use LogMAE for only 2 epochs, then switch to powerful hybrid loss
     experiment_name_prefix="Stage2_Finetune"
 ):
     """
@@ -2187,7 +2187,19 @@ def run_stage2_finetune_sincgat_unet(
     
     try:
         print(f"Loading pretrained U-Net weights into sincgat_model.unet...")
-        champion_unet_state_dict = torch.load(pretrained_unet_weights_path, map_location=device)
+        # Load pretrained U-Net weights
+        champion_unet_checkpoint = torch.load(pretrained_unet_weights_path, map_location=device, weights_only=False)
+        
+        # Handle both direct state_dict and checkpoint dict formats
+        if isinstance(champion_unet_checkpoint, dict) and 'model_state_dict' in champion_unet_checkpoint:
+            # This is a checkpoint file with multiple keys
+            champion_unet_state_dict = champion_unet_checkpoint['model_state_dict']
+            print(f"   📦 Loaded from checkpoint (epoch {champion_unet_checkpoint.get('epoch', 'unknown')})")
+        else:
+            # This is a direct state_dict
+            champion_unet_state_dict = champion_unet_checkpoint
+            print(f"   📦 Loaded direct state_dict")
+            
         sincgat_model.unet.load_state_dict(champion_unet_state_dict, strict=True)
         print("Successfully loaded pretrained U-Net weights into sincgat_model.unet.")
     except Exception as e:
@@ -2725,7 +2737,7 @@ class Stage2ExperimentalFramework:
             'logmae_initial_c': 0.1,
             'loss_fixed_weights': [1.0, 0.12, 0.007],
             'curriculum_start_simple': True,
-            'curriculum_total_epochs_for_simple_phase': 5,
+            'curriculum_total_epochs_for_simple_phase': 2,  # Changed from 5 to 2: Use LogMAE for only 2 epochs, then switch to powerful hybrid loss
             
             # Scheduler parameters
             'lr_scheduler_type': None,  # None, 'ReduceLROnPlateau', 'CosineAnnealingLR'
@@ -2786,7 +2798,18 @@ class Stage2ExperimentalFramework:
             ).to(self.device)
             
             # Load pretrained U-Net weights
-            champion_unet_state_dict = torch.load(self.pretrained_unet_weights_path, map_location=self.device)
+            champion_unet_checkpoint = torch.load(self.pretrained_unet_weights_path, map_location=self.device, weights_only=False)
+            
+            # Handle both direct state_dict and checkpoint dict formats
+            if isinstance(champion_unet_checkpoint, dict) and 'model_state_dict' in champion_unet_checkpoint:
+                # This is a checkpoint file with multiple keys
+                champion_unet_state_dict = champion_unet_checkpoint['model_state_dict']
+                print(f"   📦 Loaded from checkpoint (epoch {champion_unet_checkpoint.get('epoch', 'unknown')})")
+            else:
+                # This is a direct state_dict
+                champion_unet_state_dict = champion_unet_checkpoint
+                print(f"   📦 Loaded direct state_dict")
+                
             sincgat_model.unet.load_state_dict(champion_unet_state_dict, strict=True)
             
             # Setup loss function
@@ -2980,39 +3003,80 @@ class Stage2ExperimentalFramework:
                 serializable_history[key] = value
         return serializable_history
     
-    def run_lr_schedule_experiments(self, max_experiments=10):
-        """Run systematic learning rate and scheduler experiments."""
-        print(f"\\n🎯 Running Learning Rate & Schedule Experiments (max {max_experiments})...")
+    def run_lr_schedule_experiments(self, max_experiments=None):
+        """
+        Run systematic learning rate and scheduler experiments.
+        Now fully explores the defined grid for ALL scheduler parameters.
         
-        # Create parameter combinations
-        lr_combinations = list(itertools.product(
+        Args:
+            max_experiments: Maximum number of experiments to run. If None, runs all combinations.
+        """
+        print(f"\n🎯 Running Learning Rate & Schedule Experiments...")
+        
+        all_configs_to_run = []
+        
+        # Base LR pairs (frontend and unet learning rates)
+        base_lr_pairs = list(itertools.product(
             self.lr_schedule_grid['lr_frontend_phase_b'],
-            self.lr_schedule_grid['lr_unet_finetune_phase_b'],
-            self.lr_schedule_grid['lr_scheduler_type']
+            self.lr_schedule_grid['lr_unet_finetune_phase_b']
         ))
         
-        # Limit to max_experiments
-        lr_combinations = lr_combinations[:max_experiments]
+        for lr_frontend_b, lr_unet_b in base_lr_pairs:
+            for scheduler_type in self.lr_schedule_grid['lr_scheduler_type']:
+                config_overrides = {
+                    'lr_frontend_phase_b': lr_frontend_b,
+                    'lr_unet_finetune_phase_b': lr_unet_b,
+                    'lr_scheduler_type': scheduler_type,
+                }
+                
+                if scheduler_type == 'ReduceLROnPlateau':
+                    # Iterate through ALL patience and factor combinations for ReduceLROnPlateau
+                    for patience in self.lr_schedule_grid['scheduler_patience']:
+                        for factor in self.lr_schedule_grid['scheduler_factor']:
+                            current_config_overrides = config_overrides.copy()
+                            current_config_overrides['scheduler_patience'] = patience
+                            current_config_overrides['scheduler_factor'] = factor
+                            all_configs_to_run.append(self.create_experiment_config(**current_config_overrides))
+                elif scheduler_type == 'CosineAnnealingLR':
+                    # CosineAnnealingLR doesn't use patience/factor from this grid
+                    # It uses T_max based on num_epochs within _create_scheduler
+                    all_configs_to_run.append(self.create_experiment_config(**config_overrides))
+                elif scheduler_type is None:
+                    # No scheduler
+                    all_configs_to_run.append(self.create_experiment_config(**config_overrides))
+
+        # Calculate total possible experiments
+        total_possible_lr_experiments = len(all_configs_to_run)
+        print(f"   📊 Total unique LR/Scheduler configurations generated from grid: {total_possible_lr_experiments}")
         
-        experiment_id = len(self.experiment_results) + 1
+        # Calculate breakdown
+        num_lr_pairs = len(base_lr_pairs)
+        num_none_configs = num_lr_pairs * 1  # None scheduler
+        num_cosine_configs = num_lr_pairs * 1  # CosineAnnealingLR
+        num_reduce_configs = num_lr_pairs * len(self.lr_schedule_grid['scheduler_patience']) * len(self.lr_schedule_grid['scheduler_factor'])
         
-        for lr_frontend_b, lr_unet_b, scheduler_type in lr_combinations:
-            config_overrides = {
-                'lr_frontend_phase_b': lr_frontend_b,
-                'lr_unet_finetune_phase_b': lr_unet_b,
-                'lr_scheduler_type': scheduler_type,
-            }
-            
-            # Add scheduler-specific parameters
-            if scheduler_type == 'ReduceLROnPlateau':
-                config_overrides.update({
-                    'scheduler_patience': 5,
-                    'scheduler_factor': 0.2
-                })
-            
-            config = self.create_experiment_config(**config_overrides)
-            self.run_single_experiment(config, experiment_id)
-            experiment_id += 1
+        print(f"   📈 Breakdown: {num_lr_pairs} LR pairs × [1 None + 1 Cosine + {len(self.lr_schedule_grid['scheduler_patience'])}×{len(self.lr_schedule_grid['scheduler_factor'])} ReduceLROnPlateau] = {total_possible_lr_experiments}")
+
+        # Apply max_experiments limit if provided
+        if max_experiments is not None and max_experiments < total_possible_lr_experiments:
+            print(f"   ⚠️  Limiting to {max_experiments} experiments due to max_experiments setting.")
+            print(f"   💡 To run all configurations, call with max_experiments={total_possible_lr_experiments} or None")
+            # Potentially shuffle if you want a random subset, otherwise it takes the first N
+            # import random
+            # random.shuffle(all_configs_to_run) 
+            configs_to_actually_run = all_configs_to_run[:max_experiments]
+        else:
+            configs_to_actually_run = all_configs_to_run
+            if max_experiments is not None: # max_experiments >= total_possible_lr_experiments
+                print(f"   ✅ Running all {total_possible_lr_experiments} configurations (max_experiments is >= total).")
+            else:
+                print(f"   ✅ Running all {total_possible_lr_experiments} configurations (no max_experiments limit).")
+
+        experiment_id_start = len(self.experiment_results) + 1 
+        
+        for i, config_dict in enumerate(configs_to_actually_run):
+            current_experiment_id_str = f"lr_sched_{experiment_id_start + i}"
+            self.run_single_experiment(config_dict, current_experiment_id_str)
     
     def run_gat_config_experiments(self, max_experiments=15):
         """Run systematic GAT configuration experiments."""
@@ -3116,6 +3180,134 @@ class Stage2ExperimentalFramework:
         
         print(f"\\n📄 Summary saved to: {summary_file}")
 
+    def run_focused_lr_experiments_around_champion(self, 
+                                                  champion_lr_frontend=2e-5, 
+                                                  champion_lr_unet=5e-6,
+                                                  max_experiments=5):
+        """
+        Run a focused set of LR/scheduler experiments around a known good configuration.
+        This is efficient when you have a champion configuration and want to test small variations.
+        
+        Args:
+            champion_lr_frontend: The best known frontend learning rate
+            champion_lr_unet: The best known U-Net learning rate  
+            max_experiments: Maximum number of experiments to run
+        """
+        print(f"\n🎯 Running Focused LR Experiments Around Champion Configuration...")
+        print(f"   Champion LRs: frontend={champion_lr_frontend}, unet={champion_lr_unet}")
+        
+        focused_configs = []
+        
+        # Config 1: Champion config with no scheduler (baseline)
+        focused_configs.append(self.create_experiment_config(
+            lr_frontend_phase_b=champion_lr_frontend,
+            lr_unet_finetune_phase_b=champion_lr_unet,
+            lr_scheduler_type=None
+        ))
+        
+        # Config 2: Champion config with ReduceLROnPlateau (default patience/factor)
+        focused_configs.append(self.create_experiment_config(
+            lr_frontend_phase_b=champion_lr_frontend,
+            lr_unet_finetune_phase_b=champion_lr_unet,
+            lr_scheduler_type='ReduceLROnPlateau',
+            scheduler_patience=5,
+            scheduler_factor=0.2
+        ))
+        
+        # Config 3: Champion config with more aggressive ReduceLROnPlateau  
+        focused_configs.append(self.create_experiment_config(
+            lr_frontend_phase_b=champion_lr_frontend,
+            lr_unet_finetune_phase_b=champion_lr_unet,
+            lr_scheduler_type='ReduceLROnPlateau',
+            scheduler_patience=3,
+            scheduler_factor=0.5
+        ))
+        
+        # Config 4: Slightly higher frontend LR + scheduler
+        focused_configs.append(self.create_experiment_config(
+            lr_frontend_phase_b=champion_lr_frontend * 2.5,  # 5e-5 if champion was 2e-5
+            lr_unet_finetune_phase_b=champion_lr_unet,
+            lr_scheduler_type='ReduceLROnPlateau',
+            scheduler_patience=5,
+            scheduler_factor=0.2
+        ))
+        
+        # Config 5: Slightly higher both LRs + CosineAnnealingLR
+        focused_configs.append(self.create_experiment_config(
+            lr_frontend_phase_b=champion_lr_frontend * 1.5,  # 3e-5 if champion was 2e-5
+            lr_unet_finetune_phase_b=champion_lr_unet * 2,   # 1e-5 if champion was 5e-6
+            lr_scheduler_type='CosineAnnealingLR'
+        ))
+        
+        # Limit to max_experiments
+        configs_to_run = focused_configs[:max_experiments]
+        
+        print(f"   📊 Running {len(configs_to_run)} focused experiments")
+        
+        experiment_id_start = len(self.experiment_results) + 1
+        
+        for i, config_dict in enumerate(configs_to_run):
+            current_experiment_id_str = f"focused_lr_{experiment_id_start + i}"
+            print(f"   🔬 Focused Exp {i+1}: frontend_lr={config_dict['lr_frontend_phase_b']}, unet_lr={config_dict['lr_unet_finetune_phase_b']}, scheduler={config_dict['lr_scheduler_type']}")
+            self.run_single_experiment(config_dict, current_experiment_id_str)
+
+    def calculate_total_possible_experiments(self):
+        """
+        Calculate and display the total number of possible experiments for each grid.
+        Useful for planning experimental runs.
+        """
+        print(f"\n📊 EXPERIMENTAL SCOPE ANALYSIS")
+        print("="*50)
+        
+        # LR Schedule experiments
+        base_lr_pairs = len(self.lr_schedule_grid['lr_frontend_phase_b']) * len(self.lr_schedule_grid['lr_unet_finetune_phase_b'])
+        
+        none_configs = base_lr_pairs * 1  # None scheduler
+        cosine_configs = base_lr_pairs * 1  # CosineAnnealingLR
+        reduce_configs = base_lr_pairs * len(self.lr_schedule_grid['scheduler_patience']) * len(self.lr_schedule_grid['scheduler_factor'])
+        total_lr_configs = none_configs + cosine_configs + reduce_configs
+        
+        print(f"🎯 LR/Scheduler Experiments:")
+        print(f"   • {base_lr_pairs} LR pairs (frontend × unet)")
+        print(f"   • None scheduler: {none_configs} configs")
+        print(f"   • CosineAnnealingLR: {cosine_configs} configs")  
+        print(f"   • ReduceLROnPlateau: {reduce_configs} configs ({len(self.lr_schedule_grid['scheduler_patience'])} patience × {len(self.lr_schedule_grid['scheduler_factor'])} factor)")
+        print(f"   📈 TOTAL: {total_lr_configs} experiments")
+        
+        # GAT config experiments
+        gat_configs = 1
+        for key, values in self.gat_config_grid.items():
+            gat_configs *= len(values)
+        print(f"\n🧠 GAT Configuration Experiments:")
+        print(f"   📈 TOTAL: {gat_configs} experiments")
+        
+        # Fusion experiments  
+        fusion_configs = len(self.fusion_config_grid['fusion_ratio'])  # Only concat_conv implemented
+        print(f"\n🔗 Fusion Configuration Experiments:")
+        print(f"   📈 TOTAL: {fusion_configs} experiments (only concat_conv implemented)")
+        
+        # Training config experiments
+        training_configs = 1
+        for key, values in self.training_config_grid.items():
+            training_configs *= len(values)
+        print(f"\n⚙️  Training Configuration Experiments:")
+        print(f"   📈 TOTAL: {training_configs} experiments")
+        
+        # Combined scope
+        combined_total = total_lr_configs * gat_configs * fusion_configs * training_configs
+        print(f"\n🌍 COMBINED SCOPE (if all grids combined):")
+        print(f"   📈 TOTAL: {combined_total:,} experiments")
+        print(f"   ⚠️  This is computationally infeasible!")
+        print(f"   💡 Use structured exploration (one grid at a time) instead")
+        
+        return {
+            'lr_schedule': total_lr_configs,
+            'gat_config': gat_configs,
+            'fusion': fusion_configs,
+            'training_config': training_configs,
+            'combined_total': combined_total
+        }
+
 # === ORCHESTRATION FUNCTIONS ===
 
 def run_systematic_stage2_experiments(pretrained_unet_weights_path, 
@@ -3126,8 +3318,13 @@ def run_systematic_stage2_experiments(pretrained_unet_weights_path,
     
     Args:
         pretrained_unet_weights_path: Path to Stage 1 pretrained U-Net weights
-        experiment_type: Type of experiments to run ('lr_schedule', 'gat_config', 'fusion', 'all')
-        max_experiments: Maximum number of experiments to run
+        experiment_type: Type of experiments to run:
+            - 'lr_schedule': Full grid search of LR/scheduler combinations (~99 experiments)
+            - 'lr_focused': Focused experiments around champion configuration (~5 experiments)  
+            - 'gat_config': GAT architecture experiments
+            - 'fusion': Fusion method experiments
+            - 'all': Run subsets of each type
+        max_experiments: Maximum number of experiments to run per type
     """
     
     if not os.path.exists(pretrained_unet_weights_path):
@@ -3147,18 +3344,50 @@ def run_systematic_stage2_experiments(pretrained_unet_weights_path,
     
     # Run experiments based on type
     if experiment_type == "lr_schedule":
+        print(f"🚀 Starting comprehensive LR/scheduler grid search...")
+        print(f"   Note: This can generate up to 99 unique experiments.")
+        if max_experiments is not None and max_experiments < 99:
+            print(f"   Currently limited to {max_experiments} experiments.")
+            print(f"   To run all combinations, use max_experiments=99 or None")
+        elif max_experiments is None:
+            print(f"   Running ALL experiments (no limit set).")
+        else:
+            print(f"   Running {max_experiments} experiments.")
         framework.run_lr_schedule_experiments(max_experiments=max_experiments)
+        
+    elif experiment_type == "lr_focused":
+        print(f"🎯 Starting focused LR experiments around champion configuration...")
+        # Use the best known LRs from your 0.0931% result
+        framework.run_focused_lr_experiments_around_champion(
+            champion_lr_frontend=2e-5,
+            champion_lr_unet=5e-6,
+            max_experiments=max_experiments
+        )
+        
     elif experiment_type == "gat_config":
         framework.run_gat_config_experiments(max_experiments=max_experiments)
+        
     elif experiment_type == "fusion":
         framework.run_fusion_experiments(max_experiments=max_experiments)
+        
     elif experiment_type == "all":
-        # Run a subset of each type
-        framework.run_lr_schedule_experiments(max_experiments=max_experiments//3)
-        framework.run_gat_config_experiments(max_experiments=max_experiments//3)
-        framework.run_fusion_experiments(max_experiments=max_experiments//3)
+        # Run a balanced subset of each type
+        print(f"🔄 Running balanced experiments across all categories...")
+        lr_experiments = max(1, max_experiments // 4)
+        gat_experiments = max(1, max_experiments // 4) 
+        fusion_experiments = max(1, max_experiments // 4)
+        focused_experiments = max(1, max_experiments - lr_experiments - gat_experiments - fusion_experiments)
+        
+        print(f"   📊 Distribution: {lr_experiments} LR grid + {focused_experiments} LR focused + {gat_experiments} GAT + {fusion_experiments} fusion")
+        
+        framework.run_lr_schedule_experiments(max_experiments=lr_experiments)
+        framework.run_focused_lr_experiments_around_champion(max_experiments=focused_experiments)
+        framework.run_gat_config_experiments(max_experiments=gat_experiments)
+        framework.run_fusion_experiments(max_experiments=fusion_experiments)
+        
     else:
         print(f"❌ Unknown experiment type: {experiment_type}")
+        print(f"   Valid types: 'lr_schedule', 'lr_focused', 'gat_config', 'fusion', 'all'")
         return None
     
     # Generate summary report
@@ -3334,3 +3563,93 @@ print()
 print("   METHOD 3 - Manual control:")
 print("     • run_systematic_stage2_experiments(pretrained_path, experiment_type, max_experiments)")
 print("="*60)
+
+# === EXPERIMENTAL STRATEGY FUNCTIONS ===
+
+def run_comprehensive_lr_exploration(pretrained_weights_path):
+    """
+    Run ALL 99 LR/scheduler combinations from the defined grid.
+    ⚠️ WARNING: This is computationally expensive (~99 experiments).
+    """
+    print("🚀 COMPREHENSIVE LR EXPLORATION")
+    print("⚠️  This will run ~99 experiments. Each takes ~40 epochs.")
+    print("   Estimated time: Several hours to days depending on hardware.")
+    
+    response = input("Continue? (y/N): ")
+    if response.lower() != 'y':
+        print("❌ Cancelled by user")
+        return None
+        
+    return run_systematic_stage2_experiments(
+        pretrained_unet_weights_path=pretrained_weights_path,
+        experiment_type="lr_schedule",
+        max_experiments=None  # Run all combinations
+    )
+
+def run_focused_lr_tuning(pretrained_weights_path, champion_frontend_lr=2e-5, champion_unet_lr=5e-6):
+    """
+    Run focused LR experiments around a champion configuration.
+    This is the recommended approach when you have a good baseline.
+    """
+    print("🎯 FOCUSED LR TUNING AROUND CHAMPION")
+    print(f"   Champion LRs: frontend={champion_frontend_lr}, unet={champion_unet_lr}")
+    print("   Running ~5 targeted experiments")
+    
+    framework = Stage2ExperimentalFramework(
+        pretrained_unet_weights_path=pretrained_weights_path,
+        base_experiment_name="Stage2_Focused_LR",
+        device=device
+    )
+    framework.define_parameter_grids()
+    
+    framework.run_focused_lr_experiments_around_champion(
+        champion_lr_frontend=champion_frontend_lr,
+        champion_lr_unet=champion_unet_lr,
+        max_experiments=5
+    )
+    
+    framework.generate_summary_report()
+    return framework
+
+def run_balanced_exploration(pretrained_weights_path, total_experiments=20):
+    """
+    Run a balanced exploration across LR, GAT, and fusion experiments.
+    Good for initial exploration when you want to sample multiple areas.
+    """
+    print(f"🔄 BALANCED EXPLORATION ({total_experiments} experiments)")
+    print("   Testing multiple hyperparameter categories")
+    
+    return run_systematic_stage2_experiments(
+        pretrained_unet_weights_path=pretrained_weights_path,
+        experiment_type="all",
+        max_experiments=total_experiments
+    )
+
+def analyze_experimental_scope(pretrained_weights_path):
+    """
+    Analyze the scope of possible experiments without running any.
+    Useful for planning your experimental strategy.
+    """
+    print("📊 EXPERIMENTAL SCOPE ANALYSIS")
+    
+    framework = Stage2ExperimentalFramework(
+        pretrained_unet_weights_path=pretrained_weights_path,
+        base_experiment_name="Analysis_Only",
+        device=device
+    )
+    framework.define_parameter_grids()
+    
+    return framework.calculate_total_possible_experiments()
+
+def run_quick_lr_validation(pretrained_weights_path, num_experiments=5):
+    """
+    Quick validation of LR settings - good for testing the framework.
+    """
+    print(f"⚡ QUICK LR VALIDATION ({num_experiments} experiments)")
+    print("   Testing framework with limited experiments")
+    
+    return run_systematic_stage2_experiments(
+        pretrained_unet_weights_path=pretrained_weights_path,
+        experiment_type="lr_schedule",
+        max_experiments=num_experiments
+    )
