@@ -220,6 +220,78 @@ class StabilizedSeismicMSSSIM(nn.Module):
 
 
 # =============================================================================
+# FILM REGULARIZATION FUNCTIONS
+# =============================================================================
+
+def calculate_film_reg_loss(gamma_res, beta_res, lambda_gamma_res=0.005, lambda_beta_res=0.0005):
+    """
+    Calculates regularization loss for FiLM residual parameters (gamma_res, beta_res).
+    
+    Aims to keep gamma_res close to 0 and beta_res close to 0 for residual FiLM formulation,
+    which encourages the model to start from identity and learn meaningful deviations.
+    
+    Args:
+        gamma_res (torch.Tensor): [B, C_target] - Residual scale parameters
+        beta_res (torch.Tensor): [B, C_target] - Residual shift parameters  
+        lambda_gamma_res (float): Regularization strength for gamma_res
+        lambda_beta_res (float): Regularization strength for beta_res
+        
+    Returns:
+        torch.Tensor: Scalar regularization loss
+    """
+    if gamma_res is None or beta_res is None:
+        device = gamma_res.device if gamma_res is not None else (beta_res.device if beta_res is not None else torch.device('cpu'))
+        return torch.tensor(0.0, device=device)
+
+    # L2 regularization towards zero for residual FiLM parameters
+    loss_gamma_res = torch.mean(gamma_res**2)
+    loss_beta_res = torch.mean(beta_res**2)
+    
+    film_reg_loss = (lambda_gamma_res * loss_gamma_res) + (lambda_beta_res * loss_beta_res)
+    return film_reg_loss
+
+
+def monitor_film_parameters(gamma_res, beta_res, prefix="FiLM"):
+    """
+    Monitor FiLM parameter statistics for debugging and analysis.
+    
+    Args:
+        gamma_res (torch.Tensor): [B, C_target] - Residual scale parameters
+        beta_res (torch.Tensor): [B, C_target] - Residual shift parameters
+        prefix (str): Prefix for logging messages
+    
+    Returns:
+        dict: Statistics dictionary
+    """
+    if gamma_res is None or beta_res is None:
+        return {}
+    
+    with torch.no_grad():
+        stats = {
+            'gamma_mean': gamma_res.mean().item(),
+            'gamma_std': gamma_res.std().item(), 
+            'gamma_abs_mean': gamma_res.abs().mean().item(),
+            'gamma_max_abs': gamma_res.abs().max().item(),
+            'beta_mean': beta_res.mean().item(),
+            'beta_std': beta_res.std().item(),
+            'beta_abs_mean': beta_res.abs().mean().item(), 
+            'beta_max_abs': beta_res.abs().max().item(),
+        }
+        
+        print(f"   📊 {prefix} Parameter Stats:")
+        print(f"      γ_res: mean={stats['gamma_mean']:.4f}, std={stats['gamma_std']:.4f}, |max|={stats['gamma_max_abs']:.4f}")
+        print(f"      β_res: mean={stats['beta_mean']:.4f}, std={stats['beta_std']:.4f}, |max|={stats['beta_max_abs']:.4f}")
+        
+        # Check if parameters are learning
+        if stats['gamma_abs_mean'] > 0.01 or stats['beta_abs_mean'] > 0.01:
+            print(f"      📈 FiLM is actively modulating (|mean| > 0.01)")
+        else:
+            print(f"      🎯 FiLM near identity (|mean| ≤ 0.01)")
+            
+        return stats
+
+
+# =============================================================================
 # ADVANCED LOSS FUNCTION IMPLEMENTATIONS
 # =============================================================================
 
@@ -353,6 +425,7 @@ class RefinedLogSpaceMAEHybridLoss(nn.Module):
     3. Better curriculum transition logic
     4. Use StabilizedSeismicMSSSIM for A100 compatibility
     5. Correct champion weights [1.0, 0.12, 0.007]
+    6. FiLM regularization support for ResidualFiLMLayer conditioning
     """
     def __init__(self, min_velocity=1.5, use_adaptive_softadapt=True,
                  initial_c_logmae=0.1, logmae_momentum=0.9,
@@ -364,7 +437,11 @@ class RefinedLogSpaceMAEHybridLoss(nn.Module):
                  scale_for_softadapt=True,
                  component_scales="adaptive",  # "adaptive" or list like [10.0, 1.0, 100.0]
                  curriculum_epochs=0,  # Epochs to train only LogMAE before activating other components
-                 start_simple=False):  # If True, start with only LogMAE
+                 start_simple=False,  # If True, start with only LogMAE
+                 # FiLM regularization parameters (NEW)
+                 use_film_reg=False,        # Enable FiLM regularization
+                 lambda_gamma_res=0.005,    # Regularization strength for gamma_res
+                 lambda_beta_res=0.0005):   # Regularization strength for beta_res
         super().__init__()
         
         # CRITICAL FIX: Use correct loss components based on momentum and stability requirements
@@ -436,6 +513,11 @@ class RefinedLogSpaceMAEHybridLoss(nn.Module):
             print("⚠️  SoftAdapt requested but not available. Using fixed weights.")
             self.use_adaptive_softadapt_active = False
 
+        # FiLM regularization parameters
+        self.use_film_reg = use_film_reg
+        self.lambda_gamma_res = lambda_gamma_res
+        self.lambda_beta_res = lambda_beta_res
+
     def set_epoch(self, epoch):
         """Set current epoch for curriculum learning with proper SoftAdapt activation."""
         self.epoch_counter = torch.tensor(epoch)
@@ -463,7 +545,7 @@ class RefinedLogSpaceMAEHybridLoss(nn.Module):
                 print("⚠️  SoftAdapt library not available, falling back to fixed weights")
                 self.use_adaptive_softadapt_active = False
 
-    def forward(self, vp_pred, vp_target):
+    def forward(self, vp_pred, vp_target, model_for_film_params=None):
         # Always compute LogMAE using the correct component
         logmae_val = self.logmae_component(vp_pred, vp_target)
         
@@ -473,12 +555,28 @@ class RefinedLogSpaceMAEHybridLoss(nn.Module):
                 'total': logmae_val, 'logmae': logmae_val, 
                 'msssim': torch.tensor(0.0, device=vp_pred.device),
                 'atv': torch.tensor(0.0, device=vp_pred.device),
+                'film_reg': torch.tensor(0.0, device=vp_pred.device),
                 'weights': np.array([1.0, 0.0, 0.0])
             }
         
         # Compute other components
         msssim_val = self.ms_ssim_component(vp_pred, vp_target)
         atv_val = self.anisotropic_tv_component(vp_pred)
+
+        # FiLM regularization calculation
+        film_reg_val = torch.tensor(0.0, device=vp_pred.device)
+        if (self.use_film_reg and model_for_film_params is not None and 
+            hasattr(model_for_film_params, 'last_gamma_res') and 
+            hasattr(model_for_film_params, 'last_beta_res') and 
+            model_for_film_params.last_gamma_res is not None and
+            model_for_film_params.last_beta_res is not None):
+            
+            film_reg_val = calculate_film_reg_loss(
+                model_for_film_params.last_gamma_res,
+                model_for_film_params.last_beta_res,
+                self.lambda_gamma_res,
+                self.lambda_beta_res
+            )
 
         # SoftAdapt weight adaptation with improved scaling
         if self.use_adaptive_softadapt_active and self.training:
@@ -533,17 +631,21 @@ class RefinedLogSpaceMAEHybridLoss(nn.Module):
         else:
             weights_to_use = self.fixed_weights.to(vp_pred.device)
         
-        # CRITICAL FIX: Proper weighted combination
-        # fixed_weights[0] * LogMAE + fixed_weights[1] * (1-MS_SSIM) + fixed_weights[2] * ATV
+        # CRITICAL FIX: Proper weighted combination (including FiLM regularization)
+        # Main task loss: weights[0] * LogMAE + weights[1] * (1-MS_SSIM) + weights[2] * ATV
         # Note: ms_ssim_component already returns (1 - MS_SSIM) as loss
         # Note: atv_component already applies internal weight_h and weight_v
-        total_loss = (weights_to_use[0] * logmae_val +
-                      weights_to_use[1] * msssim_val +
-                      weights_to_use[2] * atv_val)
+        main_task_loss = (weights_to_use[0] * logmae_val +
+                         weights_to_use[1] * msssim_val +
+                         weights_to_use[2] * atv_val)
+        
+        # Total loss includes FiLM regularization (added directly, not weighted)
+        total_loss = main_task_loss + film_reg_val
         
         return {
             'total': total_loss, 'logmae': logmae_val, 'msssim': msssim_val,
-            'atv': atv_val, 'weights': weights_to_use.detach().cpu().numpy()
+            'atv': atv_val, 'film_reg': film_reg_val,  # NEW: Include FiLM reg in output
+            'weights': weights_to_use.detach().cpu().numpy()
         }
 
 
@@ -1018,8 +1120,16 @@ def run_refined_phase2_experiments(BaselineUNet, train_loader, val_loader, calcu
 
 
 def train_with_curriculum_fixed(experiment_name, model, train_loader, val_loader, criterion, optimizer,
-                               num_epochs, device, calculate_mape_func):
-    """Enhanced training function with proper curriculum learning and SoftAdapt handling."""
+                               num_epochs, device, calculate_mape_func, lr_scheduler=None, config=None):
+    """Enhanced training function with COMPLETE FiLM support, scheduler support, warm-up, and gradient clipping.
+    
+    This is the UNIFIED training loop that incorporates all FiLM-specific training dynamics:
+    - LR warm-up for frontend components
+    - Differential gradient clipping (FiLM vs others)
+    - Model passing to criterion for FiLM regularization
+    - FiLM parameter monitoring
+    - LR scheduler support
+    """
     print(f"\n--- Starting Fixed Curriculum Experiment: {experiment_name} ---")
     
     history = {'train_loss': [], 'val_mape': []}
@@ -1029,6 +1139,47 @@ def train_with_curriculum_fixed(experiment_name, model, train_loader, val_loader
         os.makedirs(checkpoint_dir)
     
     model_path = os.path.join(checkpoint_dir, f"{experiment_name}_best_mape.pth")
+    
+    # Extract config parameters with defaults
+    warmup_steps = config.get('warmup_steps', 0) if config else 0
+    gradient_clip_film = config.get('gradient_clip_film', 1.0) if config else 1.0
+    gradient_clip_others = config.get('gradient_clip_others', 5.0) if config else 5.0
+    use_grad_clipping = config.get('use_grad_clipping', True) if config else True
+    monitor_freq = config.get('monitor_freq', 50) if config else 50
+    use_film_reg = config.get('use_film_reg', False) if config else False
+    
+    # Identify parameter groups for differential treatment
+    film_params = []
+    other_trainable_params = []
+    
+    if hasattr(model, 'film_bottleneck_modulator') and model.film_bottleneck_modulator is not None:
+        film_params = list(model.film_bottleneck_modulator.parameters())
+        all_trainable_ids = {id(p) for p in model.parameters() if p.requires_grad}
+        film_ids = {id(p) for p in film_params}
+        other_trainable_params = [p for p in model.parameters() 
+                                if id(p) in all_trainable_ids and id(p) not in film_ids]
+        print(f"   📊 Found {len(film_params)} FiLM parameters and {len(other_trainable_params)} other trainable parameters")
+    else:
+        other_trainable_params = list(model.parameters())
+        print(f"   📊 No FiLM parameters found, using standard training")
+    
+    # Store initial LRs for warm-up (only for non-U-Net frontend groups)
+    initial_lrs = []
+    frontend_group_indices = []
+    
+    if warmup_steps > 0:
+        for i, param_group in enumerate(optimizer.param_groups):
+            group_name = param_group.get('group_name', '')
+            # Apply warm-up to frontend groups (SincNet, GAT, FiLM) but NOT U-Net
+            if 'UNet' not in group_name:
+                initial_lrs.append(param_group['lr'])
+                frontend_group_indices.append(i)
+                param_group['lr'] = param_group['lr'] * 0.01  # Start with 1% of target LR
+                print(f"   🌡️ Warm-up enabled for group '{group_name}': {param_group['lr']:.2e} → {initial_lrs[-1]:.2e}")
+            else:
+                print(f"   ❄️ No warm-up for group '{group_name}' (U-Net)")
+    
+    global_step = 0
     
     for epoch in range(num_epochs):
         # CRITICAL: Set epoch for curriculum learning
@@ -1040,20 +1191,57 @@ def train_with_curriculum_fixed(experiment_name, model, train_loader, val_loader
         running_train_loss = 0.0
         
         train_pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs} [Train]", leave=False)
-        for inputs, targets in train_pbar:
+        for batch_idx, (inputs, targets) in enumerate(train_pbar):
             inputs, targets = inputs.to(device), targets.to(device)
             optimizer.zero_grad()
             outputs = model(inputs)
             
-            # Handle both dict and scalar loss returns
-            loss_output = criterion(outputs, targets)
-            if isinstance(loss_output, dict):
-                loss = loss_output['total']
+            # CRITICAL FIX: Handle both dict and scalar loss returns + FiLM regularization
+            if isinstance(criterion, RefinedLogSpaceMAEHybridLoss):
+                # Pass model for FiLM regularization if enabled
+                if use_film_reg and hasattr(model, 'film_bottleneck_modulator'):
+                    loss_dict = criterion(outputs, targets, model_for_film_params=model)
+                else:
+                    loss_dict = criterion(outputs, targets)
+                loss = loss_dict['total']
+                
+                # Log FiLM regularization if available
+                if 'film_reg' in loss_dict and loss_dict['film_reg'] > 0:
+                    film_reg_loss = loss_dict['film_reg'].item()
+                    if global_step % (monitor_freq * 2) == 0:  # Log every monitor_freq*2 steps
+                        print(f"    Step {global_step}: FiLM Reg Loss: {film_reg_loss:.6f}")
             else:
-                loss = loss_output
+                loss_output = criterion(outputs, targets)
+                if isinstance(loss_output, dict):
+                    loss = loss_output['total']
+                else:
+                    loss = loss_output
             
             loss.backward()
+            
+            # CRITICAL FIX: Apply differential gradient clipping
+            if use_grad_clipping:
+                if film_params:
+                    torch.nn.utils.clip_grad_norm_(film_params, max_norm=gradient_clip_film)
+                if other_trainable_params:
+                    torch.nn.utils.clip_grad_norm_(other_trainable_params, max_norm=gradient_clip_others)
+            
+            # CRITICAL FIX: LR warm-up for frontend groups only
+            if warmup_steps > 0 and global_step < warmup_steps:
+                warmup_factor = (global_step + 1) / warmup_steps
+                for idx, group_idx in enumerate(frontend_group_indices):
+                    optimizer.param_groups[group_idx]['lr'] = initial_lrs[idx] * warmup_factor
+            
             optimizer.step()
+            
+            # FiLM parameter monitoring
+            if (film_params and global_step % monitor_freq == 0 and 
+                hasattr(model, 'last_gamma_res') and hasattr(model, 'last_beta_res') and
+                model.last_gamma_res is not None and model.last_beta_res is not None):
+                monitor_film_parameters(model.last_gamma_res, model.last_beta_res, 
+                                      prefix=f"Step {global_step}")
+            
+            global_step += 1
             running_train_loss += loss.item() * inputs.size(0)
             train_pbar.set_postfix({'loss': loss.item()})
         
@@ -1101,12 +1289,25 @@ def train_with_curriculum_fixed(experiment_name, model, train_loader, val_loader
                     except:
                         print_msg += " | Weights: [updating...]"
         
+        # Add LR info if warm-up is active
+        if warmup_steps > 0 and global_step <= warmup_steps:
+            current_lrs = [optimizer.param_groups[i]['lr'] for i in frontend_group_indices]
+            lr_str = ", ".join([f"{lr:.2e}" for lr in current_lrs])
+            print_msg += f" | Frontend LRs: [{lr_str}] (warmup)"
+        
         if epoch_val_mape < best_val_mape:
             best_val_mape = epoch_val_mape
             torch.save(model.state_dict(), model_path)
             print_msg += " <<< BEST MAPE SO FAR - MODEL SAVED"
         
         print(print_msg)
+        
+        # Step scheduler after validation
+        if lr_scheduler:
+            if isinstance(lr_scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
+                lr_scheduler.step(epoch_val_mape)
+            else:
+                lr_scheduler.step()
     
     print(f"\nFinished {experiment_name}. Best Val MAPE: {best_val_mape:.4f}%")
     return best_val_mape, history
