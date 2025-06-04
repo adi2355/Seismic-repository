@@ -4051,7 +4051,7 @@ comprehensive FiLM capabilities based on our research findings.
 # Fixes path issues and ensures all FiLM requirements are implemented
 
 def run_corrected_film_experiments(base_checkpoint_dir="checkpoints", 
-                                 champion_checkpoint_name="Extended_Absolute_Champion_epoch_40.pth"):
+                                 champion_checkpoint_name="/content/checkpoints/content/checkpoints/Extended_Absolute_Champion_epoch_40.pth"):
     """
     Corrected FiLM experiment runner that fixes path issues and ensures
     all research-backed FiLM requirements are properly implemented.
@@ -4068,8 +4068,13 @@ def run_corrected_film_experiments(base_checkpoint_dir="checkpoints",
     print("=" * 60)
     
     # === FIX 1: Correct Path Construction ===
-    champion_weights_path = os.path.join(base_checkpoint_dir, champion_checkpoint_name)
-    print(f"✅ Using corrected path: {champion_weights_path}")
+    # Use the full path directly when it starts with "/"
+    if champion_checkpoint_name.startswith("/"):
+        champion_weights_path = champion_checkpoint_name
+    else:
+        champion_weights_path = os.path.join(base_checkpoint_dir, champion_checkpoint_name)
+    
+    print(f"✅ Using path: {champion_weights_path}")
     
     # Verify path exists
     if not os.path.exists(champion_weights_path):
@@ -4224,7 +4229,7 @@ def run_corrected_film_experiments(base_checkpoint_dir="checkpoints",
     return experiments
 
 
-def run_film_monitoring_experiment(champion_weights_path):
+def run_film_monitoring_experiment(champion_weights_path=None):
     """
     Run a single FiLM experiment with comprehensive monitoring for debugging.
     
@@ -4245,6 +4250,10 @@ def run_film_monitoring_experiment(champion_weights_path):
     except ImportError:
         print("⚠️ FiLM monitoring functions not available")
         return None
+    
+    # Use provided path or default to the standard path
+    if champion_weights_path is None:
+        champion_weights_path = "/content/checkpoints/content/checkpoints/Extended_Absolute_Champion_epoch_40.pth"
     
     # Run with detailed monitoring
     result = run_stage2_film_training(
@@ -4285,19 +4294,20 @@ def run_film_monitoring_experiment(champion_weights_path):
 
 def fix_and_run_current_experiment():
     """
-    Fix the path issue and re-run the current experiment setup.
-    Use this to restart your current experiment with the corrected path.
+    Run a fixed version of the current experiment.
+    This provides a clean interface for the user to run
+    with all fixes applied.
     """
     return run_corrected_film_experiments(
         base_checkpoint_dir="checkpoints",
-        champion_checkpoint_name="Extended_Absolute_Champion_epoch_40.pth"
+        champion_checkpoint_name="/content/checkpoints/content/checkpoints/Extended_Absolute_Champion_epoch_40.pth"
     )
 
 def quick_film_debug():
     """
     Quick FiLM debugging with the corrected path.
     """
-    champion_path = "checkpoints/Extended_Absolute_Champion_epoch_40.pth"
+    champion_path = "/content/checkpoints/content/checkpoints/Extended_Absolute_Champion_epoch_40.pth"
     return run_film_monitoring_experiment(champion_path)
 
 # === UNIFIED FiLM-AWARE TRAINING FUNCTION ===
@@ -4856,7 +4866,7 @@ print("\\n🧪 Starting FiLM experiments with 3 configurations...")
 try:
     film_results = run_corrected_film_experiments(
         base_checkpoint_dir="checkpoints", 
-        champion_checkpoint_name="Stage1_TestRun_UNet_Asymmetric_best_mape.pth"
+        champion_checkpoint_name="/content/checkpoints/content/checkpoints/Extended_Absolute_Champion_epoch_40.pth"
     )
     
     if film_results:
@@ -4879,3 +4889,34 @@ except Exception as e:
     print("   • run_systematic_stage2_experiments(pretrained_path, 'film_config', 10)")
 
 
+def run_stage1_pretrain_unet(
+    num_epochs=45,
+    batch_size=8,
+    lr=1e-4,
+    weight_decay=0.01,
+    min_velocity=1.5,
+    logmae_initial_c=0.1,
+    loss_fixed_weights=[1.0, 0.12, 0.007],
+    experiment_name_prefix="Stage1_Pretrain"
+):
+    print("============================================================")
+    print("🚀 EXECUTING STAGE 1: PRE-TRAINING CHAMPION UNET 🚀")
+    print("============================================================\n")
+    print(f"--- Starting Stage 1: Pre-training Champion BaselineUNet ({num_epochs} epochs) ---")
+    print("============================================================")
+    
+    # Configure A100 stability only if CUDA is available
+    if torch.cuda.is_available():
+        configure_a100_stability(disable_tf32=True)
+    else:
+        print("🔧 Running on CPU - skipping A100 configuration")
+    
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
+    
+    # Setup data loaders - Fixed unpacking
+    train_loader, val_loader = setup_phase2_data_loaders(
+        batch_size=batch_size, num_workers=0
+    )
+
+    model = get_champion_baseline_unet_for_stage1().to(device)
