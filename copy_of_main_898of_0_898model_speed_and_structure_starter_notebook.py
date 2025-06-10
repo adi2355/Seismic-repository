@@ -4338,6 +4338,43 @@ def quick_film_debug():
 # comprehensive training loop that handles all FiLM-specific requirements
 
 # REPLACE the existing train_with_film_awareness function with this W&B-FREE version.
+# =============================================================================
+# GRADIENT CENTRALIZATION (GC) UTILITY  
+# =============================================================================
+
+def apply_gradient_centralization(model):
+    """
+    Applies Gradient Centralization (GC) in-place to the gradients of a model.
+    This function should be called after loss.backward() and before optimizer.step().
+    
+    For GCSAM, it is called after the first loss.backward() and before optimizer.first_step().
+    
+    Args:
+        model (torch.nn.Module): The model with populated .grad attributes.
+    """
+    # Iterate over all trainable parameters of the model
+    for p in model.parameters():
+        # Ensure the parameter has a gradient and requires one
+        if p.grad is not None and p.requires_grad:
+            # GC is typically applied to weight tensors (rank >= 2), not 1D bias vectors.
+            if p.grad.ndim >= 2:
+                # 1. Identify the dimensions to centralize over.
+                #    For a weight tensor W, we centralize gradients for each output unit.
+                #    This means we compute the mean over all dimensions except the first (output dimension).
+                #    e.g., Conv2D weight (out_ch, in_ch, H, W) -> mean over dims (1, 2, 3)
+                #    e.g., Linear weight (out_feat, in_feat) -> mean over dim 1
+                dims_to_reduce = tuple(range(1, p.grad.ndim))
+                
+                # 2. Compute the mean of the gradients over the identified dimensions.
+                #    keepdim=True ensures the mean tensor has the same number of dimensions
+                #    as the original gradient, which is necessary for broadcasting.
+                mean = torch.mean(p.grad, dim=dims_to_reduce, keepdim=True)
+                
+                # 3. Subtract the mean from the gradient in-place.
+                #    .sub_() is an in-place operation, which is memory-efficient.
+                p.grad.sub_(mean)
+
+
 
 def train_with_film_awareness(
     experiment_name, model, train_loader, val_loader, criterion,
@@ -4416,12 +4453,15 @@ def train_with_film_awareness(
             
             if is_sam:
                 # SAM requires two forward passes with BatchNorm handling
-                
                 # First forward pass (ascent step) - ALLOW BatchNorm updates
                 enable_running_stats(model)  # ✅ FIX: Enable BN stats updates
                 loss_dict = criterion(model(inputs), targets, model_for_film_params=model)
                 total_loss = loss_dict['total']
                 total_loss.backward()
+                # 🔥 GCSAM: Apply Gradient Centralization before SAM first step
+                use_gc = config.get('use_gc', False) if config is not None else False
+                if use_gc:
+                    apply_gradient_centralization(model)
                 optimizer.first_step(zero_grad=True)
                 
                 # Second forward pass (descent step) - FREEZE BatchNorm stats
