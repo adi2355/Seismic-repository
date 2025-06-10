@@ -3625,35 +3625,42 @@ def run_stage2_film_training(
         {'params': model.unet.parameters(), 'lr': lr_unet, 'weight_decay': weight_decay, 'group_name': 'U-Net', 'apply_warmup': False}
     ]
     
-    base_optimizer = torch.optim.AdamW(optimizer_config)
-    
-    # Wrap with SAM if requested
+    # Check if SAM is requested and available
+    # Check if SAM is requested and available
     use_sam = config.get('use_sam', False)
-    if use_sam and 'SAM_AVAILABLE' in globals() and SAM_AVAILABLE:
+    sam_available = config.get('SAM_AVAILABLE', False)
+    SAM_CLASS = config.get('SAM_CLASS', None)
+
+    if use_sam and sam_available and SAM_CLASS is not None:
         sam_rho = config.get('sam_rho', 0.05)
         sam_adaptive = config.get('sam_adaptive', True)
         
-        optimizer = SAM(
-            base_optimizer,
-            rho=sam_rho,
+        # ✅ CORRECT: Pass parameter groups and optimizer CLASS to SAM
+        optimizer = SAM_CLASS(
+            optimizer_config,          # Parameter groups (not model.parameters())
+            torch.optim.AdamW,         # Optimizer CLASS (not instance)
+            rho=sam_rho,              # SAM parameters
             adaptive=sam_adaptive
         )
         print(f"✅ Using SAM optimizer: rho={sam_rho}, adaptive={sam_adaptive}")
     else:
-        optimizer = base_optimizer
+        # Standard optimizer
+        optimizer = torch.optim.AdamW(optimizer_config)
         if use_sam:
             print("⚠️  SAM requested but not available, using standard AdamW")
     # --- Scheduler Setup ---
 # --- Enhanced Scheduler Setup ---
     scheduler = None
     if scheduler_type == 'ReduceLROnPlateau':
+        # ✅ CRITICAL FIX: Use base_optimizer for SAM compatibility
+        target_optimizer = optimizer.base_optimizer if hasattr(optimizer, 'base_optimizer') else optimizer
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer, 
-            mode='min',           # Reduce when MAPE stops decreasing
-            factor=0.2,           # Reduce LR by factor of 5 (was 0.5)
-            patience=3,           # Wait only 3 epochs (was 5) 
-            threshold=0.001,      # Minimum change to qualify as improvement
-            min_lr=1e-8,          # Don't go below this LR
+            target_optimizer,  # ✅ FIXED: Use base_optimizer, not SAM wrapper
+            mode='min',           
+            factor=0.5,           
+            patience=6,           
+            threshold=0.001,      
+            min_lr=1e-8,          
             verbose=True
         )
         print(f"   📉 ReduceLROnPlateau: factor=0.2, patience=3, threshold=0.001")
@@ -3664,8 +3671,9 @@ def run_stage2_film_training(
         T_mult = config.get('T_mult', 1)
         eta_min = config.get('eta_min', 1e-8)
         
+        target_optimizer = optimizer.base_optimizer if hasattr(optimizer, 'base_optimizer') else optimizer
         scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
-            optimizer, T_0=T_0, T_mult=T_mult, eta_min=eta_min, verbose=True
+            target_optimizer, T_0=T_0, T_mult=T_mult, eta_min=eta_min, verbose=True
         )
         print(f"   📈 CosineAnnealingWarmRestarts: T_0={T_0} epochs, T_mult={T_mult}, eta_min={eta_min}")
 
@@ -4492,16 +4500,53 @@ def train_with_film_awareness(
             # Only activate scheduler AFTER curriculum phase ends
             if epoch >= curriculum_simple_epochs:
                 if isinstance(lr_scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
+                    # ✅ COMPREHENSIVE SCHEDULER DEBUG
+                    target_optimizer = optimizer.base_optimizer if hasattr(optimizer, 'base_optimizer') else optimizer
+                    prev_lr = target_optimizer.param_groups[0]['lr']
+                    
+                    # 🔍 DEBUG: Scheduler state BEFORE step
+                    print(f"   🔍 SCHEDULER DEBUG [BEFORE step]:")
+                    print(f"       Current MAPE: {avg_val_mape:.6f}%")
+                    print(f"       Scheduler best: {lr_scheduler.best:.6f}%")
+                    print(f"       Bad epochs: {lr_scheduler.num_bad_epochs}/{lr_scheduler.patience}")
+                    print(f"       Threshold: {lr_scheduler.threshold}")
+                    print(f"       Factor: {lr_scheduler.factor}")
+                    print(f"       Current LR: {prev_lr:.2e}")
+                    
+                    # Calculate if this is actually an improvement
+                    if lr_scheduler.best is None:
+                        is_improvement = True
+                        improvement_amount = "N/A (first epoch)"
+                    else:
+                        improvement_amount = lr_scheduler.best - avg_val_mape
+                        is_improvement = improvement_amount > lr_scheduler.threshold
+                    
+                    print(f"       Improvement: {improvement_amount} ({'✅ YES' if is_improvement else '❌ NO'} > {lr_scheduler.threshold})")
+                    
+                    # STEP THE SCHEDULER
                     lr_scheduler.step(avg_val_mape)
-                    # Log LR changes
-                    current_lr = optimizer.param_groups[0]['lr']
-                    if hasattr(lr_scheduler, '_last_lr') and current_lr != lr_scheduler._last_lr:
-                        print(f"   📉 LR reduced to {current_lr:.2e} due to MAPE plateau")
+                    
+                    # 🔍 DEBUG: Scheduler state AFTER step
+                    current_lr = target_optimizer.param_groups[0]['lr']
+                    print(f"   🔍 SCHEDULER DEBUG [AFTER step]:")
+                    print(f"       New best: {lr_scheduler.best:.6f}%")
+                    print(f"       Bad epochs: {lr_scheduler.num_bad_epochs}/{lr_scheduler.patience}")
+                    print(f"       New LR: {current_lr:.2e}")
+                    
+                    # Check if LR actually changed
+                    if current_lr < prev_lr:
+                        print(f"   📉 LR REDUCED from {prev_lr:.2e} to {current_lr:.2e} due to MAPE plateau")
+                    elif current_lr == prev_lr:
+                        print(f"   ➡️  LR UNCHANGED at {current_lr:.2e}")
+                    else:
+                        print(f"   ⚠️  LR INCREASED from {prev_lr:.2e} to {current_lr:.2e} (UNEXPECTED!)")
+                    
                     print("   🎯 Scheduler ACTIVE (post-curriculum)")
                 elif isinstance(lr_scheduler, torch.optim.lr_scheduler.CosineAnnealingWarmRestarts):
                     # CosineAnnealingWarmRestarts is stepped per-batch, not per-epoch
                     # The actual stepping happens inside the batch loop
-                    current_lr = optimizer.param_groups[0]['lr']
+                    target_optimizer = optimizer.base_optimizer if hasattr(optimizer, 'base_optimizer') else optimizer
+                    current_lr = target_optimizer.param_groups[0]['lr']
                     print(f"   🌊 Cosine LR: {current_lr:.2e} (epoch {epoch+1})")
                     print("   🎯 Scheduler ACTIVE (post-curriculum)")
                 else:
