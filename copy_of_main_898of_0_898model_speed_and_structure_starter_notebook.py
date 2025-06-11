@@ -566,6 +566,201 @@ exec(open('phase2_experimental_framework.py').read())
 # =============================================================================
 # INTEGRATION WITH EXISTING NOTEBOOK INFRASTRUCTURE
 # =============================================================================
+class PlateauToCosineScheduler:
+    """
+    Hybrid scheduler: ReduceLROnPlateau → CosineAnnealingLR transition
+    WARMUP-AWARE: Monitors a parameter group that is NOT undergoing warmup
+    """
+    def __init__(self, optimizer, plateau_kwargs, cosine_kwargs, 
+                 lr_switch_threshold=2.5e-05, verbose=True, 
+                 threshold_group_index=0):  # ✅ FINAL FIX: Monitor U-Net group (no warmup)
+        # ✅ FIX: Handle SAM optimizer wrapping
+        self.base_optimizer = optimizer.base_optimizer if hasattr(optimizer, 'base_optimizer') else optimizer
+        self.optimizer = optimizer  # Keep reference to original (for SAM compatibility)
+        
+        # ✅ FINAL FIX: Validate the threshold group index
+        if threshold_group_index >= len(self.base_optimizer.param_groups):
+            raise ValueError(f"threshold_group_index {threshold_group_index} is out of bounds for optimizer with {len(self.base_optimizer.param_groups)} parameter groups.")
+        self.threshold_group_index = threshold_group_index
+        
+        self.plateau_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(self.base_optimizer, **plateau_kwargs)
+        self.cosine_kwargs = cosine_kwargs
+        self.lr_switch_threshold = lr_switch_threshold
+        self.switched = False
+        self.cosine_scheduler = None
+        self.verbose = verbose
+                # ✅ NEW: Warmup-aware state tracking
+        self.target_lr = self.base_optimizer.param_groups[self.threshold_group_index].get('lr')  # Store initial/target LR
+        self.warmup_complete = False                    # Track warmup completion status
+        self.warmup_threshold_ratio = 0.9               # LR must reach 90% of target to consider warmup complete
+        self.step_count = 0                             # Track number of scheduler steps
+
+        if self.verbose:
+            monitored_group_name = self.base_optimizer.param_groups[self.threshold_group_index].get('group_name', f"Group {self.threshold_group_index}")
+            print(f"   🚀 PlateauToCosineScheduler: Monitoring '{monitored_group_name}' (index {self.threshold_group_index}) for LR threshold detection.")
+
+    def step(self, metrics=None):
+        self.step_count += 1
+        
+        if self.switched:
+            # Phase 2: Cosine annealing
+            if self.cosine_scheduler is not None:
+                prev_lr = self.base_optimizer.param_groups[self.threshold_group_index]['lr']
+                self.cosine_scheduler.step()
+                current_lr = self.base_optimizer.param_groups[self.threshold_group_index]['lr']
+                if self.verbose:
+                    monitored_group_name = self.base_optimizer.param_groups[self.threshold_group_index].get('group_name', f'Group {self.threshold_group_index}')
+                    print(f"   🌊 COSINE PHASE: '{monitored_group_name}' LR: {prev_lr:.2e} → {current_lr:.2e}")
+            return
+        
+        # ✅ NEW: Enhanced debugging BEFORE plateau step
+        current_lr_before = self.base_optimizer.param_groups[self.threshold_group_index]['lr']
+        monitored_group_name = self.base_optimizer.param_groups[self.threshold_group_index].get('group_name', f'Group {self.threshold_group_index}')
+        
+        if self.verbose:
+            print(f"\n📊 PLATEAU SCHEDULER DEBUG (Step {self.step_count}):")
+            print(f"   🎯 Monitoring: '{monitored_group_name}' (Group {self.threshold_group_index})")
+            print(f"   📈 Current LR: {current_lr_before:.2e}")
+            print(f"   📉 Loss (MAPE): {metrics:.6f}")
+            print(f"   🎚️  Threshold: {self.lr_switch_threshold:.2e}")
+            # Only show switch condition during active monitoring (after warmup)
+            if self.warmup_complete:
+                print(f"   ⏳ Switch condition: {current_lr_before:.2e} <= {self.lr_switch_threshold:.2e} = {current_lr_before <= self.lr_switch_threshold}")
+            else:
+                print(f"   ⏸️  Switch condition: DISABLED (warmup active)")
+        
+        # ✅ NEW: Check warmup completion status
+        if not self.warmup_complete:
+            # Warmup is complete when current LR reaches 90% of target LR
+            if current_lr_before >= self.target_lr * self.warmup_threshold_ratio:
+                self.warmup_complete = True
+                if self.verbose:
+                    print(f"   🌡️ WARMUP COMPLETE: '{monitored_group_name}' LR={current_lr_before:.2e} (≥{self.target_lr * self.warmup_threshold_ratio:.2e})")
+                    print(f"   📊 Threshold monitoring now ACTIVE")
+        
+        # The Plateau scheduler MUST be stepped first to potentially reduce the LR
+        if metrics is None:
+            raise ValueError("Metrics must be provided for the Plateau phase of the scheduler.")
+        
+        # ✅ NEW: Get plateau scheduler internal state before step
+        plateau_internal_best = getattr(self.plateau_scheduler, 'best', 'N/A')
+        plateau_num_bad_epochs = getattr(self.plateau_scheduler, 'num_bad_epochs', 'N/A')
+        plateau_patience = getattr(self.plateau_scheduler, 'patience', 'N/A')
+        plateau_factor = getattr(self.plateau_scheduler, 'factor', 'N/A')
+        
+        if self.verbose:
+            print(f"   📋 Plateau State: best={plateau_internal_best:.6f}, bad_epochs={plateau_num_bad_epochs}/{plateau_patience}, factor={plateau_factor}")
+        
+        self.plateau_scheduler.step(metrics)
+        
+        # ✅ NEW: Check what happened after plateau step
+        current_lr_after = self.base_optimizer.param_groups[self.threshold_group_index]['lr']
+        lr_was_reduced = current_lr_after < current_lr_before
+        
+        if self.verbose:
+            if lr_was_reduced:
+                print(f"   📉 PLATEAU REDUCED LR: {current_lr_before:.2e} → {current_lr_after:.2e}")
+            else:
+                print(f"   ➡️  PLATEAU: No LR change (LR={current_lr_after:.2e})")
+        
+        # ✅ NEW: Only check threshold AFTER warmup is complete
+        if self.warmup_complete:
+            if current_lr_after <= self.lr_switch_threshold:
+                if not self.switched:  # Prevent repeated messages
+                    self.switched = True
+                    if self.verbose:
+                        print(f"\n🚀 SCHEDULER SWITCH TRIGGERED!")
+                        print(f"   Condition: '{monitored_group_name}' LR ({current_lr_after:.2e}) ≤ threshold ({self.lr_switch_threshold:.2e})")
+                        print(f"   Switching to CosineAnnealingLR for final {self.cosine_kwargs.get('T_max', 'N/A')} polishing epochs.")
+                    
+                    # Initialize the cosine scheduler now
+                    self.cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(self.base_optimizer, **self.cosine_kwargs)
+                    
+                    # Optional: Adjust optimizer betas for the settle phase
+                    if not hasattr(self, '_betas_adjusted'):
+                        print("   🛠️  ADJUSTING OPTIMIZER: Reducing AdamW beta1 for final polishing.")
+                        for group in self.base_optimizer.param_groups:
+                            if 'betas' in group:
+                                group['betas'] = (0.7, 0.999)
+                        self._betas_adjusted = True
+            else:
+                if self.verbose:
+                    print(f"   ✅ PLATEAU CONTINUES: LR ({current_lr_after:.2e}) > threshold ({self.lr_switch_threshold:.2e})")
+        else:
+            # Still in warmup phase - NO threshold checking, just log progress
+            if self.verbose:
+                print(f"   🌡️ WARMUP PHASE: '{monitored_group_name}' LR={current_lr_after:.2e} (target: {self.target_lr:.2e}, need: {self.target_lr * self.warmup_threshold_ratio:.2e})")
+                print(f"   ⏸️  Threshold monitoring DISABLED during warmup")
+
+
+def verify_tf32_status():
+    """Check and print current TF32 settings"""
+    print("🔍 TF32 STATUS VERIFICATION:")
+    
+    # Check matmul TF32
+    matmul_tf32 = torch.backends.cuda.matmul.allow_tf32
+    print(f"   torch.backends.cuda.matmul.allow_tf32: {matmul_tf32}")
+    
+    # Check cudnn TF32  
+    cudnn_tf32 = torch.backends.cudnn.allow_tf32
+    print(f"   torch.backends.cudnn.allow_tf32: {cudnn_tf32}")
+    
+    # Overall status
+    if matmul_tf32 or cudnn_tf32:
+        print("   ⚠️  TF32 IS ENABLED - May cause precision issues!")
+        return False
+    else:
+        print("   ✅ TF32 IS DISABLED - Full precision maintained")
+        return True
+
+def force_disable_tf32():
+    """Forcefully disable TF32 and verify"""
+    print("🛠️ DISABLING TF32 FOR PRECISION...")
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.backends.cudnn.allow_tf32 = False
+    
+    # Verify it worked
+    return verify_tf32_status()
+
+def debug_scheduler_and_optimizer_state(scheduler, optimizer, epoch, step_name=""):
+    """Deep debug of scheduler and optimizer state"""
+    print(f"\n🔍 DEEP DEBUG [{step_name}] Epoch {epoch}:")
+    
+    # Check if it's SAM wrapped
+    base_opt = optimizer.base_optimizer if hasattr(optimizer, 'base_optimizer') else optimizer
+    
+    print(f"   Optimizer type: {type(optimizer).__name__}")
+    print(f"   Base optimizer type: {type(base_opt).__name__}")
+    
+    # Print ALL parameter group LRs
+    for i, group in enumerate(base_opt.param_groups):
+        group_name = group.get('group_name', f'Group_{i}')
+        print(f"   Param Group {i} ({group_name}): LR = {group['lr']:.2e}")
+    
+    # Check scheduler state (handle None case)
+    if scheduler is None:
+        print("   Scheduler: None (not created yet)")
+    elif hasattr(scheduler, 'switched'):
+        # ✅ FIX: Use the optimizer parameter instead of scheduler.base_optimizer
+        try:
+            # Try to use scheduler's base_optimizer if it exists
+            if hasattr(scheduler, 'base_optimizer'):
+                sched_base_opt = scheduler.base_optimizer
+            else:
+                # Fallback to the optimizer we already have
+                sched_base_opt = base_opt
+            
+            sched_lr = sched_base_opt.param_groups[scheduler.threshold_group_index]['lr']
+            monitored_group_name = sched_base_opt.param_groups[scheduler.threshold_group_index].get('group_name', f'Group {scheduler.threshold_group_index}')
+            print(f"   Scheduler reads LR: {sched_lr:.2e} (from {monitored_group_name})")
+            print(f"   Switch threshold: {scheduler.lr_switch_threshold:.2e}")
+            print(f"   Already switched: {scheduler.switched}")
+            print(f"   Switch condition: {sched_lr:.2e} <= {scheduler.lr_switch_threshold:.2e} = {sched_lr <= scheduler.lr_switch_threshold}")
+        except Exception as e:
+            print(f"   ❌ Scheduler debug error: {e}")
+            print(f"   Scheduler attributes: {[attr for attr in dir(scheduler) if not attr.startswith('_')]}")
+    else:
+        print(f"   Scheduler type: {type(scheduler).__name__}")
 
 def integrate_phase2_with_existing_notebook():
     """Integrate Phase 2 experiments with your existing notebook infrastructure."""
@@ -3545,8 +3740,6 @@ def run_quick_lr_validation(pretrained_weights_path, num_experiments=5):
 # === FiLM TRAINING FUNCTIONS ===
 
 
-# REPLACE the existing run_stage2_film_training function with this W&B-FREE version.
-
 def run_stage2_film_training(
     pretrained_unet_weights_path,
     config: dict
@@ -3618,11 +3811,11 @@ def run_stage2_film_training(
 
     # --- Optimizer Setup ---
     optimizer_config = [
-        {'params': model.shot_encoder.parameters(), 'lr': lr_frontend, 'weight_decay': weight_decay, 'group_name': 'SincNet', 'apply_warmup': True},
-        {'params': model.gat_fusion.parameters(), 'lr': lr_frontend, 'weight_decay': weight_decay, 'group_name': 'GAT', 'apply_warmup': True},
-        {'params': model.gat_context_layernorm.parameters(), 'lr': lr_film, 'weight_decay': weight_decay, 'group_name': 'GAT_Norm', 'apply_warmup': True},
-        {'params': model.film_bottleneck_modulator.parameters(), 'lr': lr_film, 'weight_decay': weight_decay_film, 'group_name': 'FiLM', 'apply_warmup': True},
-        {'params': model.unet.parameters(), 'lr': lr_unet, 'weight_decay': weight_decay, 'group_name': 'U-Net', 'apply_warmup': False}
+    {'params': model.shot_encoder.parameters(), 'lr': lr_frontend, 'weight_decay': weight_decay, 'group_name': 'SincNet', 'apply_warmup': True},     # ✅ RE-ENABLE
+    {'params': model.gat_fusion.parameters(), 'lr': lr_frontend, 'weight_decay': weight_decay, 'group_name': 'GAT', 'apply_warmup': True},           # ✅ RE-ENABLE  
+    {'params': model.gat_context_layernorm.parameters(), 'lr': lr_film, 'weight_decay': weight_decay, 'group_name': 'GAT_Norm', 'apply_warmup': True}, # ✅ RE-ENABLE
+    {'params': model.film_bottleneck_modulator.parameters(), 'lr': lr_film, 'weight_decay': weight_decay_film, 'group_name': 'FiLM', 'apply_warmup': True}, # ✅ RE-ENABLE
+    {'params': model.unet.parameters(), 'lr': lr_unet, 'weight_decay': weight_decay, 'group_name': 'U-Net', 'apply_warmup': False}  # ✅ U-Net: No warmup
     ]
     
     # Check if SAM is requested and available
@@ -3646,26 +3839,55 @@ def run_stage2_film_training(
     else:
         # Standard optimizer
         optimizer = torch.optim.AdamW(optimizer_config)
+        
         if use_sam:
             print("⚠️  SAM requested but not available, using standard AdamW")
     # --- Scheduler Setup ---
 # --- Enhanced Scheduler Setup ---
     scheduler = None
+    debug_scheduler_and_optimizer_state(None, optimizer, 0, "AFTER_OPTIMIZER_CREATION")
     if scheduler_type == 'ReduceLROnPlateau':
         # ✅ CRITICAL FIX: Use base_optimizer for SAM compatibility
         target_optimizer = optimizer.base_optimizer if hasattr(optimizer, 'base_optimizer') else optimizer
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            target_optimizer,  # ✅ FIXED: Use base_optimizer, not SAM wrapper
+            target_optimizer,
             mode='min',           
-            factor=0.5,           
-            patience=6,           
+            factor=0.8,           
+            patience=3,           
             threshold=0.001,      
             min_lr=1e-8,          
             verbose=True
         )
-        print(f"   📉 ReduceLROnPlateau: factor=0.2, patience=3, threshold=0.001")
+        print(f"   📉 ReduceLROnPlateau: factor=0.8, patience=3, threshold=0.001")
+    elif scheduler_type == 'PlateauToCosine':
+        # 🚀 NEW: Hybrid scheduler
+        target_optimizer = optimizer.base_optimizer if hasattr(optimizer, 'base_optimizer') else optimizer
+        plateau_kwargs = {
+            'mode': 'min',
+            'factor': config.get('plateau_factor', 0.8),
+            'patience': config.get('plateau_patience', 3),
+            'threshold': config.get('plateau_threshold', 0.001),
+            'min_lr': 1e-8,
+            'verbose': True
+        }
+        cosine_kwargs = {
+            'T_max': config.get('cosine_T_max', 8),
+            'eta_min': config.get('cosine_eta_min', 1e-8)
+        }
+        scheduler = PlateauToCosineScheduler(
+            target_optimizer,
+            plateau_kwargs=plateau_kwargs,
+            cosine_kwargs=cosine_kwargs,
+            lr_switch_threshold=config.get('lr_switch_threshold', 2.5e-05),
+            threshold_group_index=config.get('threshold_group_index', 0),  # ✅ FINAL FIX: Monitor U-Net group
+            verbose=True
+        )
+        print(f"   🚀 PlateauToCosine: threshold={config.get('lr_switch_threshold', 2.5e-05):.2e}, cosine_epochs={config.get('cosine_T_max', 8)}")
+        debug_scheduler_and_optimizer_state(scheduler, optimizer, 0, "AFTER_PLATEAU_TO_COSINE_CREATION")
     elif scheduler_type == 'CosineAnnealingLR':
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epochs_phase_b, eta_min=1e-7)
+        target_optimizer = optimizer.base_optimizer if hasattr(optimizer, 'base_optimizer') else optimizer
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(target_optimizer, T_max=num_epochs_phase_b, eta_min=1e-7)
+        print(f"   📈 CosineAnnealingLR: T_max={num_epochs_phase_b} epochs, eta_min=1e-7")
     elif scheduler_type == 'CosineAnnealingWarmRestarts':
         T_0 = config.get('T_0', 8)
         T_mult = config.get('T_mult', 1)
@@ -3676,7 +3898,7 @@ def run_stage2_film_training(
             target_optimizer, T_0=T_0, T_mult=T_mult, eta_min=eta_min, verbose=True
         )
         print(f"   📈 CosineAnnealingWarmRestarts: T_0={T_0} epochs, T_mult={T_mult}, eta_min={eta_min}")
-
+    debug_scheduler_and_optimizer_state(scheduler, optimizer, 0, "BEFORE_TRAINING_STARTS")
     # --- ✅ TRAINING CALL FIX: Pass curriculum_simple_epochs correctly ---
     training_result = train_with_film_awareness(
         experiment_name=experiment_name,
@@ -4448,7 +4670,7 @@ def train_with_film_awareness(
                 lr_scale = min(1.0, (global_step + 1) / warmup_steps)
                 for group_idx, initial_lr in initial_lrs.items():
                     optimizer.param_groups[group_idx]['lr'] = initial_lr * lr_scale
-            
+                    
             is_sam = hasattr(optimizer, 'first_step')
             
             if is_sam:
@@ -4539,61 +4761,49 @@ def train_with_film_awareness(
         if lr_scheduler is not None:
             # Only activate scheduler AFTER curriculum phase ends
             if epoch >= curriculum_simple_epochs:
+                # ✅ SAM-compatible optimizer targeting
+                target_optimizer = optimizer.base_optimizer if hasattr(optimizer, 'base_optimizer') else optimizer
+                prev_lr = target_optimizer.param_groups[0]['lr']
+                
                 if isinstance(lr_scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
-                    # ✅ COMPREHENSIVE SCHEDULER DEBUG
-                    target_optimizer = optimizer.base_optimizer if hasattr(optimizer, 'base_optimizer') else optimizer
-                    prev_lr = target_optimizer.param_groups[0]['lr']
-                    
-                    # 🔍 DEBUG: Scheduler state BEFORE step
-                    print(f"   🔍 SCHEDULER DEBUG [BEFORE step]:")
-                    print(f"       Current MAPE: {avg_val_mape:.6f}%")
-                    print(f"       Scheduler best: {lr_scheduler.best:.6f}%")
-                    print(f"       Bad epochs: {lr_scheduler.num_bad_epochs}/{lr_scheduler.patience}")
-                    print(f"       Threshold: {lr_scheduler.threshold}")
-                    print(f"       Factor: {lr_scheduler.factor}")
-                    print(f"       Current LR: {prev_lr:.2e}")
-                    
-                    # Calculate if this is actually an improvement
-                    if lr_scheduler.best is None:
-                        is_improvement = True
-                        improvement_amount = "N/A (first epoch)"
-                    else:
-                        improvement_amount = lr_scheduler.best - avg_val_mape
-                        is_improvement = improvement_amount > lr_scheduler.threshold
-                    
-                    print(f"       Improvement: {improvement_amount} ({'✅ YES' if is_improvement else '❌ NO'} > {lr_scheduler.threshold})")
-                    
-                    # STEP THE SCHEDULER
+                    # Standard ReduceLROnPlateau
                     lr_scheduler.step(avg_val_mape)
-                    
-                    # 🔍 DEBUG: Scheduler state AFTER step
                     current_lr = target_optimizer.param_groups[0]['lr']
-                    print(f"   🔍 SCHEDULER DEBUG [AFTER step]:")
-                    print(f"       New best: {lr_scheduler.best:.6f}%")
-                    print(f"       Bad epochs: {lr_scheduler.num_bad_epochs}/{lr_scheduler.patience}")
-                    print(f"       New LR: {current_lr:.2e}")
-                    
-                    # Check if LR actually changed
                     if current_lr < prev_lr:
-                        print(f"   📉 LR REDUCED from {prev_lr:.2e} to {current_lr:.2e} due to MAPE plateau")
-                    elif current_lr == prev_lr:
-                        print(f"   ➡️  LR UNCHANGED at {current_lr:.2e}")
+                        print(f"   📉 ReduceLROnPlateau: LR reduced {prev_lr:.2e} → {current_lr:.2e}")
                     else:
-                        print(f"   ⚠️  LR INCREASED from {prev_lr:.2e} to {current_lr:.2e} (UNEXPECTED!)")
+                        print(f"   ➡️  ReduceLROnPlateau: LR unchanged at {current_lr:.2e}")
+                        
+                elif isinstance(lr_scheduler, PlateauToCosineScheduler):
+                    # Get the monitored group index from scheduler
+                    monitored_group_idx = lr_scheduler.threshold_group_index
+                    prev_lr = target_optimizer.param_groups[monitored_group_idx]['lr']
                     
-                    print("   🎯 Scheduler ACTIVE (post-curriculum)")
+                    lr_scheduler.step(avg_val_mape)
+                    current_lr = target_optimizer.param_groups[monitored_group_idx]['lr']
+                    group_name = target_optimizer.param_groups[monitored_group_idx].get('group_name', f'Group {monitored_group_idx}')
+                    
+                    if lr_scheduler.switched:
+                        print(f"   🌊 Cosine phase ({group_name}): LR={current_lr:.2e} (smooth descent)")
+                    else:
+                        if current_lr < prev_lr:
+                            print(f"   📉 Plateau phase ({group_name}): LR reduced {prev_lr:.2e} → {current_lr:.2e}")
+                        else:
+                            print(f"   ➡️  Plateau phase ({group_name}): LR={current_lr:.2e}")
+                            
                 elif isinstance(lr_scheduler, torch.optim.lr_scheduler.CosineAnnealingWarmRestarts):
                     # CosineAnnealingWarmRestarts is stepped per-batch, not per-epoch
-                    # The actual stepping happens inside the batch loop
-                    target_optimizer = optimizer.base_optimizer if hasattr(optimizer, 'base_optimizer') else optimizer
                     current_lr = target_optimizer.param_groups[0]['lr']
-                    print(f"   🌊 Cosine LR: {current_lr:.2e} (epoch {epoch+1})")
-                    print("   🎯 Scheduler ACTIVE (post-curriculum)")
+                    print(f"   🌊 CosineWarmRestarts: LR={current_lr:.2e}")
+                    
                 else:
+                    # Other schedulers
                     lr_scheduler.step()
-                    print("   🎯 Scheduler ACTIVE (post-curriculum)")
+                    current_lr = target_optimizer.param_groups[0]['lr']
+                    print(f"   🎯 {type(lr_scheduler).__name__}: LR={current_lr:.2e}")
+                    
             else:
-                print(f"   ⏸️  Scheduler INACTIVE (curriculum epoch {epoch+1}/{curriculum_simple_epochs})")
+                print(f"   ⏸️  Scheduler inactive (curriculum epoch {epoch+1}/{curriculum_simple_epochs})")
 
     final_result = {
         'best_mape': best_val_mape,
