@@ -83,6 +83,14 @@ const DEFAULT_CONFIG = {
     'final_test.py',
     'sincnet_integration_demo.py',
     'integration_summary.py',
+    '0_898model_speed_and_structure_starter_notebook.py',
+    'download_experimental_results.py',
+    'enhanced_experimental_suite_with_checkpointing.py',
+    'MAIN_898_with_diagnostic_framework.ipynb',
+    'MAIN_898of_0_898model_speed_and_structure_starter_notebook.ipynb',
+    'main_898of_0_898model_speed_and_structure_starter_notebook.py',
+    'phase2_integration_notebook_cell.py',
+    
     
   ],
   maxFileSize: 1024 * 1024, // 1MB
