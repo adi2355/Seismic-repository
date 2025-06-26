@@ -6,7 +6,7 @@ import matplotlib.pyplot as plt
 from anytree import Node, RenderTree
 from typing import Dict, List
 from tqdm.auto import tqdm
-
+import torch.optim.swa_utils as swa_utils
 from utils import *
 
 """# Data
@@ -5021,4 +5021,340 @@ def run_corrected_film_validation():
         'all_components_working': True
     }
 
+def run_swa_phase(
+    base_model_path,
+    train_loader,
+    val_loader,
+    criterion,
+    swa_config,
+    device,
+    calculate_mape_func
+):
+    """
+    SWA Phase for 0.0657% MAPE model refinement.
+    
+    Args:
+        base_model_path: Path to best checkpoint (.pth file)
+        train_loader: Training DataLoader
+        val_loader: Validation DataLoader  
+        criterion: RefinedLogSpaceMAEHybridLoss instance
+        swa_config: Dictionary with SWA parameters
+        device: torch.device
+        calculate_mape_func: calculate_mape function
+    """
+    import torch.optim.swa_utils as swa_utils
+    
+    print(f"\n🔄 SWA PHASE INITIALIZATION")
+    print(f"   Base model: {base_model_path}")
+    print(f"   SWA epochs: {swa_config['num_swa_epochs']}")
+    
+    # 1. Load base model
+    model = CompleteSincGAT_UNet(
+        film_generator_mlp_type=swa_config.get('film_generator_mlp_type', '2_layer')
+    ).to(device)
+    
+    checkpoint = torch.load(base_model_path, map_location=device, weights_only=False)
+    if 'model_state_dict' in checkpoint:
+        model.load_state_dict(checkpoint['model_state_dict'])
+    else:
+        model.load_state_dict(checkpoint)
+    print(f"   ✅ Base model loaded")
+    
+    # 2. Initialize SWA model
+    swa_model = swa_utils.AveragedModel(model).to(device)
+    print(f"   ✅ SWA model initialized")
+    
+    # 3. SWA Optimizer (small LRs)
+    swa_lr_factor = swa_config.get('swa_lr_factor', 0.1)
+    
+    optimizer_groups = [
+        {'params': model.shot_encoder.parameters(), 'lr': swa_config.get('lr_frontend', 5e-5) * swa_lr_factor, 'group_name': 'SincNet_SWA'},
+        {'params': model.gat_fusion.parameters(), 'lr': swa_config.get('lr_frontend', 5e-5) * swa_lr_factor, 'group_name': 'GAT_SWA'},
+        {'params': model.gat_context_layernorm.parameters(), 'lr': swa_config.get('lr_film', 1e-4) * swa_lr_factor, 'group_name': 'GAT_Norm_SWA'},
+        {'params': model.film_bottleneck_modulator.parameters(), 'lr': swa_config.get('lr_film', 1e-4) * swa_lr_factor, 'group_name': 'FiLM_SWA'},
+        {'params': model.unet.parameters(), 'lr': swa_config.get('lr_unet', 1e-5) * swa_lr_factor, 'group_name': 'U-Net_SWA'}
+    ]
+    
+    swa_optimizer = torch.optim.AdamW(optimizer_groups, weight_decay=swa_config.get('weight_decay', 0.01))
+    
+    print(f"   ✅ SWA optimizer created (LR factor: {swa_lr_factor})")
+    
+    # 4. SWA Training Loop
+    num_swa_epochs = swa_config['num_swa_epochs']
+    swa_update_freq = swa_config.get('swa_update_freq', 1)
+    
+    for epoch in range(num_swa_epochs):
+        model.train()
+        running_loss = 0.0
+        
+        progress_bar = tqdm(train_loader, desc=f"SWA Epoch {epoch+1}/{num_swa_epochs}", leave=False)
+        for inputs, targets in progress_bar:
+            inputs, targets = inputs.to(device), targets.to(device)
+            
+            swa_optimizer.zero_grad()
+            outputs = model(inputs)
+            
+            loss_dict = criterion(outputs, targets, model_for_film_params=model)
+            loss = loss_dict['total']
+            
+            loss.backward()
+            
+            # Gradient clipping (same as main training)
+            film_params = list(model.film_bottleneck_modulator.parameters())
+            if film_params:
+                torch.nn.utils.clip_grad_norm_(film_params, 1.0)
+            
+            for group in swa_optimizer.param_groups:
+                if group['group_name'] != 'FiLM_SWA':
+                    torch.nn.utils.clip_grad_norm_(group['params'], 5.0)
+            
+            swa_optimizer.step()
+            running_loss += loss.item()
+            progress_bar.set_postfix(loss=f"{loss.item():.4f}")
+        
+        avg_epoch_loss = running_loss / len(train_loader)
+        print(f"   SWA Epoch {epoch+1} Loss: {avg_epoch_loss:.6f}")
+        
+        # Update SWA model
+        if epoch % swa_update_freq == 0:
+            swa_model.update_parameters(model)
+            print(f"   ✅ SWA model updated")
+    
+    # 5. Update BatchNorm stats
+    print(f"   🔄 Updating BatchNorm statistics...")
+    swa_utils.update_bn(train_loader, swa_model, device=device)
+    print(f"   ✅ BatchNorm update complete")
+    
+    # 6. Evaluate SWA model
+    swa_model.eval()
+    total_val_mape = 0.0
+    val_samples = 0
+    
+    with torch.no_grad():
+        for inputs, targets in tqdm(val_loader, desc="Evaluating SWA Model", leave=False):
+            inputs, targets_torch = inputs.to(device), targets.to(device)
+            outputs = swa_model(inputs)
+            
+            outputs_np = outputs.squeeze(1).cpu().numpy()
+            targets_np = targets_torch.squeeze(1).cpu().numpy()
+            
+            for i in range(outputs_np.shape[0]):
+                total_val_mape += calculate_mape_func(targets_np[i], outputs_np[i])
+                val_samples += 1
+    
+    final_swa_mape = total_val_mape / val_samples if val_samples > 0 else float('inf')
+    print(f"   🎯 SWA Model MAPE: {final_swa_mape:.4f}%")
+    
+    # 7. Save SWA model
+    experiment_name = swa_config.get('config_id', 'SWA_model')
+    swa_model_path = os.path.join(CHECKPOINT_DIR, f"{experiment_name}_swa_best.pth")
+    torch.save(swa_model.state_dict(), swa_model_path)
+    print(f"   💾 SWA model saved: {swa_model_path}")
+    
+    return {
+        'swa_val_mape': final_swa_mape,
+        'swa_model_path': swa_model_path
+    }
 
+
+def apply_swa_to_best_model(best_model_path, num_swa_epochs=10):
+    """
+    Apply SWA to your best model (0.0657% MAPE).
+    
+    Args:
+        best_model_path: Path to your best checkpoint
+        num_swa_epochs: Number of SWA epochs (default: 10)
+    """
+    print("🚀 APPLYING SWA TO CHAMPION MODEL")
+    print("=" * 60)
+    
+    # Setup
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if 'cuda' in str(device):
+        configure_a100_stability()
+    
+    # Data loaders
+    train_loader, val_loader = setup_phase2_data_loaders(batch_size=4, num_workers=0)
+    
+    # Loss function (same as training)
+    criterion = RefinedLogSpaceMAEHybridLoss(
+        min_velocity=1.5,
+        initial_c_logmae=0.1,
+        fixed_weights_list=[1.0, 0.12, 0.007],
+        lambda_gamma_res=0.005,
+        lambda_beta_res=0.0005,
+        use_film_reg=True,
+        start_simple=False,
+        curriculum_epochs=0
+    ).to(device)
+    
+    # SWA configuration
+    swa_config = {
+        'config_id': 'Champion_SWA',
+        'num_swa_epochs': num_swa_epochs,
+        'swa_lr_factor': 0.1,  # 10% of original LRs
+        'swa_update_freq': 1,
+        'film_generator_mlp_type': '2_layer',
+        'lr_frontend': 5e-5,  # Your Phase 2B LRs
+        'lr_film': 1e-4,
+        'lr_unet': 1e-5,
+        'weight_decay': 0.01
+    }
+    
+    # Run SWA
+    swa_results = run_swa_phase(
+        base_model_path=best_model_path,
+        train_loader=train_loader,
+        val_loader=val_loader,
+        criterion=criterion,
+        swa_config=swa_config,
+        device=device,
+        calculate_mape_func=calculate_mape
+    )
+    
+    if swa_results:
+        print(f"\n🎉 SWA RESULTS:")
+        print(f"   SWA MAPE: {swa_results['swa_val_mape']:.4f}%")
+        print(f"   Model saved: {swa_results['swa_model_path']}")
+        
+        # Compare to your current best
+        current_best = 0.0657  # Your current champion MAPE
+        if swa_results['swa_val_mape'] < current_best:
+            improvement = ((current_best - swa_results['swa_val_mape']) / current_best) * 100
+            print(f"   🚀 IMPROVEMENT: {improvement:.2f}% better than champion!")
+        else:
+            print(f"   📊 SWA MAPE vs Champion: {swa_results['swa_val_mape']:.4f}% vs {current_best:.4f}%")
+    
+    return swa_results
+def run_swa_on_champion():
+    """
+    Example of how to apply SWA to your champion model.
+    
+    Replace the path with your actual best checkpoint path.
+    """
+    # Path to your best model (replace with actual path)
+    champion_path = "/content/checkpoints/Phase2a_Only_PhaseA_FrontendFrozen_best_mape.pth"
+    
+    # Apply SWA
+    results = apply_swa_to_best_model(
+        best_model_path=champion_path,
+        num_swa_epochs=10  # Adjust as needed
+    )
+    
+    return results
+
+def visual_overfitting_check_fixed(model_path, num_samples=8):
+    """
+    Visual inspection for overfitting patterns in predictions - FIXED VERSION.
+    
+    Args:
+        model_path: Path to your model
+        num_samples: Number of samples to visualize
+    """
+    print("👁️  VISUAL OVERFITTING INSPECTION")
+    print("=" * 50)
+    
+    # Load model and data
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = CompleteSincGAT_UNet(film_generator_mlp_type='2_layer').to(device)
+    
+    try:
+        import torch.optim.swa_utils as swa_utils
+        swa_model = swa_utils.AveragedModel(model)
+        swa_model.load_state_dict(torch.load(model_path, map_location=device))
+        model = swa_model
+    except:
+        model.load_state_dict(torch.load(model_path, map_location=device))
+    
+    model.eval()
+    
+    # Get validation data
+    _, val_loader = setup_phase2_data_loaders(batch_size=1, random_state=42)
+    
+    # Collect predictions and analyze patterns
+    residual_patterns = []
+    prediction_smoothness = []
+    predictions = []
+    targets = []
+    residuals = []
+    sample_mapes = []
+    
+    # ✅ FIXED: Create 2 rows - residuals (top) + scatter plots (bottom)
+    fig, axes = plt.subplots(2, 4, figsize=(20, 10))
+    
+    with torch.no_grad():
+        for idx, (inputs, targets_batch) in enumerate(val_loader):
+            if idx >= 8:  # Get 8 samples
+                break
+                
+            inputs, targets_batch = inputs.to(device), targets_batch.to(device)
+            outputs = model(inputs)
+            
+            # Convert to numpy
+            pred = outputs.squeeze().cpu().numpy()
+            true = targets_batch.squeeze().cpu().numpy()
+            residual = pred - true
+            
+            # Store for analysis
+            predictions.append(pred)
+            targets.append(true)
+            residuals.append(residual)
+            sample_mapes.append(calculate_mape(true, pred))
+            
+            # Analyze patterns
+            residual_patterns.append(np.std(residual))
+            
+            # Check for unrealistic smoothness (overfitting sign)
+            pred_grad_h = np.gradient(pred, axis=0)
+            pred_grad_v = np.gradient(pred, axis=1)
+            smoothness = np.mean(np.abs(pred_grad_h)) + np.mean(np.abs(pred_grad_v))
+            prediction_smoothness.append(smoothness)
+            
+            # ✅ FIXED: Plot residual heatmaps (TOP ROW)
+            if idx < 4:
+                im = axes[0, idx].imshow(residual, cmap='RdBu_r', vmin=-0.4, vmax=0.4)
+                axes[0, idx].set_title(f'Residual {idx+1}\nMAPE: {sample_mapes[idx]:.4f}%')
+                axes[0, idx].axis('off')
+                
+            # ✅ FIXED: Plot scatter plots (BOTTOM ROW)  
+            if idx < 4:
+                pred_flat = pred.flatten()
+                true_flat = true.flatten()
+                
+                # Scatter plot with proper sampling for performance
+                n_points = min(5000, len(pred_flat))
+                indices = np.random.choice(len(pred_flat), n_points, replace=False)
+                
+                axes[1, idx].scatter(true_flat[indices], pred_flat[indices], 
+                                   alpha=0.5, s=1, c='blue')
+                
+                # Perfect prediction line
+                min_val = min(true_flat.min(), pred_flat.min())
+                max_val = max(true_flat.max(), pred_flat.max())
+                axes[1, idx].plot([min_val, max_val], [min_val, max_val], 'r--', lw=2)
+                
+                axes[1, idx].set_xlabel('True Velocity')
+                axes[1, idx].set_ylabel('Predicted Velocity')
+                axes[1, idx].set_title(f'Pred vs True {idx+1}')
+                axes[1, idx].grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    plt.suptitle('Prediction Residuals (Blue=Underprediction, Red=Overprediction)', y=1.02)
+    plt.show()
+    
+    # Analysis
+    residual_consistency = np.std(residual_patterns) / np.mean(residual_patterns)
+    smoothness_consistency = np.std(prediction_smoothness) / np.mean(prediction_smoothness)
+    
+    print(f"📊 VISUAL ANALYSIS:")
+    print(f"   Residual pattern consistency: {residual_consistency:.3f}")
+    print(f"   Prediction smoothness consistency: {smoothness_consistency:.3f}")
+    
+    if residual_consistency < 0.2 and smoothness_consistency < 0.3:
+        print("   ✅ Consistent prediction patterns - No obvious overfitting")
+    elif residual_consistency < 0.4:
+        print("   ⚠️  Some pattern variation - Monitor closely")
+    else:
+        print("   🚨 High pattern variation - Possible overfitting")
+    
+    return residual_patterns, prediction_smoothness
